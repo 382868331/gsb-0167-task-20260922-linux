@@ -19,9 +19,11 @@ from vmshoot import (
     AsidBusy,
     CrossPageAccess,
     FrameExhausted,
+    InvalidAddressSpace,
     InvalidationsPending,
     MappingConflict,
     MappingExists,
+    NotCopyOnWrite,
     NotMapped,
     PERM_EXEC,
     PERM_READ,
@@ -41,21 +43,27 @@ NEED_OF = {AccessType.READ: PERM_READ, AccessType.WRITE: PERM_WRITE,
 
 
 class RefMMU:
-    """按题面独立实现的朴素参考机（与被测实现不共享任何算法代码）。"""
+    """按题面独立实现的朴素参考机（与被测实现不共享任何算法代码）。
+
+    含独立的帧引用计数（``self.refs``）、地址空间克隆与写时复制分裂。
+    小页 PTE 表示为 ``(ppn, perms, cow)``；大页叶子为 ``("H", base, perms)``。
+    """
 
     def __init__(self):
         self.used = [False] * NUM_FRAMES
-        # l1 项：None / ("H", base_ppn, perms) / [16 个 (ppn, perms) 或 None]
+        self.refs = [0] * NUM_FRAMES
+        # l1 项：None / ("H", base_ppn, perms) / [16 个 (ppn, perms, cow) 或 None]
         self.spaces: dict[int, list] = {}
         self.tlb: list[OrderedDict] = [OrderedDict() for _ in range(2)]
         self.tickets: dict[int, dict] = {}
         self.next_id = 1
 
-    # ---- 帧：独立首位适配 ----------------------------------------------
+    # ---- 帧：独立首位适配 + 引用计数 ------------------------------------
     def alloc_small(self) -> int:
         for i, u in enumerate(self.used):
             if not u:
                 self.used[i] = True
+                self.refs[i] = 1
                 return i
         raise FrameExhausted("ref exhausted")
 
@@ -64,22 +72,38 @@ class RefMMU:
             if all(not self.used[s + j] for j in range(16)):
                 for j in range(16):
                     self.used[s + j] = True
+                    self.refs[s + j] = 1
                 return s
         raise FrameExhausted("ref huge exhausted")
 
+    def retain(self, ppn: int) -> None:
+        assert self.used[ppn]
+        self.refs[ppn] += 1
+
+    def release(self, ppn: int) -> None:
+        assert self.used[ppn] and self.refs[ppn] > 0
+        self.refs[ppn] -= 1
+        if self.refs[ppn] == 0:
+            self.used[ppn] = False
+
     # ---- ASID -----------------------------------------------------------
-    def create(self) -> int:
+    def _alloc_slot(self) -> int:
         active = set(self.spaces)
         if len(active) >= 4:
             raise AddressSpaceLimit("ref limit")
+        busy = []
         for cand in range(4):
             if cand in active:
                 continue
             if any(t["asid"] == cand for t in self.tickets.values()):
+                busy.append(cand)
                 continue
             self.spaces[cand] = [None] * 16
             return cand
-        raise AsidBusy(0, [])
+        raise AsidBusy(busy[0], [])
+
+    def create(self) -> int:
+        return self._alloc_slot()
 
     def destroy(self, asid) -> None:
         l1 = self.spaces[asid]
@@ -87,11 +111,11 @@ class RefMMU:
             if isinstance(e, tuple):
                 _, base, _ = e
                 for j in range(16):
-                    self.used[base + j] = False
+                    self.release(base + j)
             elif isinstance(e, list):
                 for pte in e:
                     if pte is not None:
-                        self.used[pte[0]] = False
+                        self.release(pte[0])
         del self.spaces[asid]
         for tlb in self.tlb:
             for k in [k for k in tlb if k[0] == asid]:
@@ -105,9 +129,9 @@ class RefMMU:
             return None
         if isinstance(e, tuple):
             _, base, perms = e
-            return (base, perms, True)  # 大页返回基帧号；偏移由 translate 处理
+            return (base, perms, True, False)  # 大页永不 cow
         pte = e[l2i]
-        return None if pte is None else (pte[0], pte[1], False)
+        return None if pte is None else (pte[0], pte[1], False, pte[2])
 
     # ---- 结构操作 -------------------------------------------------------
     def issue(self, asid, kind, va, keys) -> int:
@@ -146,7 +170,7 @@ class RefMMU:
         if e is None:
             e = [None] * 16
             l1[l1i] = e
-        e[l2i] = (ppn, perms)
+        e[l2i] = (ppn, perms, False)
         return self.issue(asid, "map", va, self.keys_for(asid, va, False))
 
     def unmap(self, asid, va) -> int:
@@ -159,13 +183,13 @@ class RefMMU:
                 raise MappingConflict("ref huge interior")
             _, base, _ = e
             for j in range(16):
-                self.used[base + j] = False
+                self.release(base + j)
             self.spaces[asid][l1i] = None
             return self.issue(asid, "unmap", va, self.keys_for(asid, va, True))
         if e is None or e[l2i] is None:
             raise NotMapped("ref")
         ppn = e[l2i][0]
-        self.used[ppn] = False
+        self.release(ppn)
         e[l2i] = None
         if all(x is None for x in e):
             self.spaces[asid][l1i] = None
@@ -178,14 +202,87 @@ class RefMMU:
         e = self.spaces[asid][l1i]
         if isinstance(e, tuple):
             _, base, old_perms = e
-            table = [(base + j, old_perms) for j in range(16)]
-            table[l2i] = (base + l2i, perms)
+            table = [(base + j, old_perms, False) for j in range(16)]
+            table[l2i] = (base + l2i, perms, False)
             self.spaces[asid][l1i] = table
             return self.issue(asid, "protect", va, self.keys_for(asid, va & ~0xFFF, True))
         if e is None or e[l2i] is None:
             raise NotMapped("ref")
-        e[l2i] = (e[l2i][0], perms)
+        old = e[l2i]
+        if perms & PERM_WRITE:
+            cow = self.refs[old[0]] > 1
+        else:
+            cow = False
+        e[l2i] = (old[0], perms, cow)  # protect 按引用计数维护 cow 标志
         return self.issue(asid, "protect", va, self.keys_for(asid, va, False))
+
+    # ---- 克隆与写时复制（独立实现） --------------------------------------
+    def clone(self, parent):
+        if parent not in self.spaces:
+            raise InvalidAddressSpace("ref no space")
+        child = self._alloc_slot()
+        pl1 = self.spaces[parent]
+        cl1 = self.spaces[child]
+        # 先收集共享帧并 retain
+        shares = []  # (l1i, kind, payload)
+        for l1i, e in enumerate(pl1):
+            if isinstance(e, tuple):
+                _, base, perms = e
+                shares.append((l1i, "H", base, perms))
+            elif isinstance(e, list):
+                ptes = [(l2i, pte[0], pte[1]) for l2i, pte in enumerate(e)
+                        if pte is not None]
+                if ptes:
+                    shares.append((l1i, "S", ptes, None))
+        for item in shares:
+            if item[1] == "H":
+                base = item[2]
+                for j in range(16):
+                    self.retain(base + j)
+            else:
+                for _, ppn, _ in item[2]:
+                    self.retain(ppn)
+        # 装入子 + 展开父
+        keys = []
+        for item in shares:
+            l1i, kind = item[0], item[1]
+            base_vpn = l1i * 16
+            if kind == "H":
+                base, perms = item[2], item[3]
+                cow = bool(perms & PERM_WRITE)
+                cl1[l1i] = [(base + j, perms, cow) for j in range(16)]
+                pl1[l1i] = [(base + j, perms, cow) for j in range(16)]
+                keys.extend((parent, base_vpn + j) for j in range(16))
+            else:
+                ptes = item[2]
+                tbl = [None] * 16
+                for l2i, ppn, perms in ptes:
+                    cow = bool(perms & PERM_WRITE)
+                    tbl[l2i] = (ppn, perms, cow)
+                    pl1[l1i][l2i] = (ppn, perms, cow)
+                    keys.append((parent, base_vpn + l2i))
+                cl1[l1i] = tbl
+        return child, self.issue(parent, "clone", 0, tuple(keys))
+
+    def handle_write_fault(self, asid, va):
+        if va & 0xFF:
+            raise ValueError("align")
+        l1i, l2i = (va >> 12) & 0xF, (va >> 8) & 0xF
+        if asid not in self.spaces:
+            raise InvalidAddressSpace("ref no space")
+        e = self.spaces[asid][l1i]
+        if isinstance(e, tuple):
+            raise NotCopyOnWrite("ref huge not cow")
+        if e is None or e[l2i] is None:
+            raise NotMapped("ref")
+        ppn, perms, cow = e[l2i]
+        if not cow:
+            raise NotCopyOnWrite("ref not cow")
+        new_ppn = self.alloc_small()       # 先分配：失败则不变
+        new_perms = perms | PERM_WRITE
+        e[l2i] = (new_ppn, new_perms, False)
+        self.release(ppn)
+        return self.issue(asid, "cow", va, self.keys_for(asid, va, False))
 
     # ---- 票据 -----------------------------------------------------------
     def ack(self, core, tid) -> None:
@@ -230,7 +327,7 @@ class RefMMU:
         if entry is None:
             w = self.walk(asid, va)
             if w is None:
-                return (False, None, "not_mapped", "walk")
+                return (False, None, "not_mapped", "walk", False)
             entry = w
             key = (asid, vpn if not w[2] else vpn & ~15)
             if key in tlb:
@@ -239,19 +336,24 @@ class RefMMU:
                 tlb[key] = entry
                 if len(tlb) > 8:
                     tlb.popitem(last=False)
-        ppn, perms, huge = entry
+        ppn, perms, huge, cow = entry
         region = 4096 if huge else 256
         if (va & (region - 1)) + length > region:
             raise CrossPageAccess("ref cross")
+        if need_bit == PERM_WRITE and cow:
+            return (False, None, "write", via, True)
         if not (perms & need_bit):
             fault = {PERM_READ: "read", PERM_WRITE: "write",
                      PERM_EXEC: "execute"}[need_bit]
-            return (False, None, fault, via)
+            return (False, None, fault, via, False)
         off = va & (0xFFF if huge else 0xFF)
-        return (True, ppn * 256 + off, None, via)
+        return (True, ppn * 256 + off, None, via, False)
 
     def used_frames(self) -> int:
         return sum(1 for x in self.used if x)
+
+    def ref_counts(self):
+        return tuple(self.refs)
 
 
 def _ref_create(m):
@@ -282,7 +384,7 @@ class TestDifferential(unittest.TestCase):
                 if rw is None:
                     self.assertIsNone(sw, f"asid={asid} va=0x{va:x}")
                 else:
-                    self.assertEqual((sw.ppn, sw.perms, sw.huge), rw,
+                    self.assertEqual((sw.ppn, sw.perms, sw.huge, sw.cow), rw,
                                      f"asid={asid} va=0x{va:x}")
                     expected_off = va & 0xFFF if rw[2] else va & 0xFF
                     self.assertEqual(sw.phys_addr, rw[0] * 256 + expected_off)
@@ -292,6 +394,14 @@ class TestDifferential(unittest.TestCase):
             self.assertEqual(list(sut._tlb[core].keys()), list(ref.tlb[core].keys()))
             for k in ref.tlb[core]:
                 self.assertEqual(sut._tlb[core][k], ref.tlb[core][k])
+
+    def _assert_refs_match(self, sut: MMU, ref: RefMMU):
+        """逐帧核对引用计数与占用位图（写时复制共享/最后引用释放的权威核对）。"""
+        self.assertEqual(sut.mem.num_frames, NUM_FRAMES)
+        for ppn in range(NUM_FRAMES):
+            self.assertEqual(sut.mem.frame_refs(ppn), ref.refs[ppn],
+                             f"帧 {ppn} 引用计数不一致")
+        self.assertEqual(sut.mem.used_frames(), ref.used_frames())
 
     # ---- 双跑比较器 ------------------------------------------------------
     def _cmp_void(self, fn, sut, ref):
@@ -327,6 +437,37 @@ class TestDifferential(unittest.TestCase):
         self.assertEqual(st.targets, (0, 1))
         self.assertEqual(st.asid, rt["asid"])
 
+    def _cmp_clone(self, sut, ref, parent):
+        try:
+            rc, rid = ref.clone(parent)
+        except Exception as exc:
+            with self.assertRaises(type(exc)):
+                sut.clone_address_space(parent)
+            return None
+        sc, st = sut.clone_address_space(parent)
+        rt = ref.tickets[rid]
+        self.assertEqual(sc, rc)
+        self.assertEqual(st.id, rid)
+        self.assertEqual(st.keys, rt["keys"])
+        self.assertEqual(st.targets, (0, 1))
+        self.assertEqual(st.asid, rt["asid"])
+        self._assert_refs_match(sut, ref)
+        return sc
+
+    def _cmp_write_fault(self, sut, ref, asid, va):
+        try:
+            rid = ref.handle_write_fault(asid, va)
+        except Exception as exc:
+            with self.assertRaises(type(exc)):
+                sut.handle_write_fault(asid, va)
+            return
+        st = sut.handle_write_fault(asid, va)
+        rt = ref.tickets[rid]
+        self.assertEqual(st.id, rid)
+        self.assertEqual(st.keys, rt["keys"])
+        self.assertEqual(st.asid, rt["asid"])
+        self._assert_refs_match(sut, ref)
+
     def _cmp_translate(self, sut, ref, asid, core, va, acc, length):
         try:
             rv = ref.translate(asid, core, va, NEED_OF[acc], length)
@@ -335,8 +476,9 @@ class TestDifferential(unittest.TestCase):
                 sut.translate(asid, core, va, acc, length)
             return
         sr = sut.translate(asid, core, va, acc, length)
-        self.assertEqual((sr.ok, sr.phys_addr, sr.fault, sr.via), rv,
-                         f"asid={asid} core={core} va=0x{va:x} {acc.name} len={length}")
+        self.assertEqual(
+            (sr.ok, sr.phys_addr, sr.fault, sr.via, sr.cow), rv,
+            f"asid={asid} core={core} va=0x{va:x} {acc.name} len={length}")
 
     def test_random_sequence_matches_reference(self):
         self._run_one(20260922, 600)
@@ -355,12 +497,16 @@ class TestDifferential(unittest.TestCase):
             r = rng.random()
             active = sorted(ref.spaces)
             with self.subTest(step=step):
-                if r < 0.07:
+                if r < 0.06:
                     self._cmp_id(lambda m: _ref_create(m), sut, ref)
-                elif r < 0.12 and active:
+                elif r < 0.10 and active:
                     a = rng.choice(active)
                     self._cmp_void(lambda m, a=a: _ref_destroy(m, a), sut, ref)
-                elif r < 0.40 and active:
+                    self._assert_refs_match(sut, ref)
+                elif r < 0.16 and active:
+                    a = rng.choice(active)
+                    self._cmp_clone(sut, ref, a)
+                elif r < 0.38 and active:
                     a = rng.choice(active)
                     huge = rng.random() < 0.35
                     va = self._huge_va(rng) if huge else self._small_va(rng)
@@ -369,17 +515,24 @@ class TestDifferential(unittest.TestCase):
                         lambda m, a=a, va=va, p=perms, h=huge:
                             m.map(a, va, p, h) if isinstance(m, RefMMU)
                             else m.map(a, va, p, huge=h), sut, ref)
-                elif r < 0.50 and active:
+                    self._assert_refs_match(sut, ref)
+                elif r < 0.47 and active:
                     a = rng.choice(active)
                     self._cmp_ticket(
                         lambda m, a=a, va=self._small_va(rng): m.unmap(a, va), sut, ref)
-                elif r < 0.62 and active:
+                    self._assert_refs_match(sut, ref)
+                elif r < 0.57 and active:
                     a = rng.choice(active)
                     va = self._small_va(rng)
                     perms = rng.choice(PERMS_CHOICES)
                     self._cmp_ticket(
                         lambda m, a=a, va=va, p=perms: m.protect(a, va, p), sut, ref)
-                elif r < 0.88 and active:
+                elif r < 0.64 and active:
+                    # 显式写故障事件（串行处理 COW 分裂）；未映射/非 COW 时双方同样报错
+                    a = rng.choice(active)
+                    va = self._small_va(rng)
+                    self._cmp_write_fault(sut, ref, a, va)
+                elif r < 0.86 and active:
                     a = rng.choice(active)
                     core = rng.randrange(2)
                     va = rng.randrange(0x10000)
@@ -401,6 +554,7 @@ class TestDifferential(unittest.TestCase):
                         self._cmp_void(lambda m, t=tid: m.finish(t), sut, ref)
                 else:
                     self._assert_walks_match(sut, ref)
+                    self._assert_refs_match(sut, ref)
 
         # 收尾：ACK 并 finish 全部票据，做最终全量核对
         for tid in sorted(ref.tickets):
@@ -413,7 +567,7 @@ class TestDifferential(unittest.TestCase):
         self.assertEqual(sut.pending_tickets(), [])
         self._assert_walks_match(sut, ref)
         self._assert_tlb_match(sut, ref)
-        self.assertEqual(sut.mem.used_frames(), ref.used_frames())
+        self._assert_refs_match(sut, ref)
 
 
 if __name__ == "__main__":

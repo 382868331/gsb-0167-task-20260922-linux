@@ -39,7 +39,11 @@ class MappingExists(VMShootError):
 
 
 class NotMapped(VMShootError):
-    """目标虚拟页没有映射（unmap/protect 要求已映射）。"""
+    """目标虚拟页没有映射（unmap/protect/写故障处理要求已映射）。"""
+
+
+class NotCopyOnWrite(VMShootError):
+    """对一个不是写时复制（COW）状态的页调用 :meth:`MMU.handle_write_fault`。"""
 
 
 class MappingConflict(VMShootError):

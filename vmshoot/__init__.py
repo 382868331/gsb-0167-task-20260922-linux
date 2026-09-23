@@ -7,7 +7,15 @@
 * 2 个核，每核 8 项 LRU TLB；TLB 的 key 为 ``(asid, vpn)``，故不同地址空间
   的缓存天然隔离，大页项以 16 对齐的 vpn 作为 key。
 * 最多 4 个活动地址空间（ASID 0..3）。物理内存只是 Python 内的位图模拟，
-  不调用任何 OS 映射（无 mmap）。
+  不调用任何 OS 映射（无 mmap）；每帧带引用计数以支持地址空间克隆共享。
+
+地址空间克隆与写时复制（COW）：
+
+* :meth:`MMU.clone_address_space` 让父子空间共享同一批普通物理页（引用计数 +1、
+  不分配新帧），可写页双方打 ``cow`` 标记，大页在父子两侧就地展开为 16 小页；
+* 对 COW 页的写访问令 :meth:`MMU.translate` 返回 ``fault="write", cow=True``，
+  须显式串行调用 :meth:`MMU.handle_write_fault` 分配私有新帧、切换 PTE、释放旧帧
+  引用，并发出 ``kind="cow"`` 的失效票据；最后一个引用释放时帧才回收。
 
 失效协议（map/unmap/protect）：
 
@@ -46,6 +54,7 @@ from .errors import (
     InvalidationsPending,
     MappingConflict,
     MappingExists,
+    NotCopyOnWrite,
     NotMapped,
     TicketError,
 )
@@ -106,6 +115,7 @@ __all__ = [
     "InvalidationsPending",
     "MappingConflict",
     "MappingExists",
+    "NotCopyOnWrite",
     "NotMapped",
     "TicketError",
 ]
