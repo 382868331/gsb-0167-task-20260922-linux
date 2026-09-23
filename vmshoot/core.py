@@ -13,10 +13,13 @@ from .errors import (
     AsidBusy,
     AddressSpaceLimit,
     CrossPageAccess,
+    FrameExhausted,
     InvalidAddressSpace,
     InvalidationsPending,
+    InvalidWriteFault,
     MappingConflict,
     MappingExists,
+    MemoryAccessFault,
     NotMapped,
     TicketError,
 )
@@ -58,18 +61,23 @@ class AccessType(IntEnum):
 # ===========================================================================
 @dataclass
 class PTE:
-    """页表项。``huge=True`` 时它是一级叶子，``ppn`` 为 16 对齐的起始帧号。"""
+    """页表项。``huge=True`` 时它是一级叶子，``ppn`` 为 16 对齐的起始帧号。
+
+    ``cow=True`` 表示该小页正被克隆出的地址空间共享（写时复制）：写入前必须
+    先经 :meth:`MMU.handle_write_fault` 显式分裂。大页不参与 COW（克隆时深拷贝）。
+    """
 
     ppn: int
     perms: int
     huge: bool = False
+    cow: bool = False
 
 
 @dataclass
 class Ticket:
     """失效票据。
 
-    * ``kind``：``map`` / ``unmap`` / ``protect``；
+    * ``kind``：``map`` / ``unmap`` / ``protect`` / ``clone`` / ``cow``；
     * ``keys``：需要失效的 TLB key（小页粒度的 ``(asid, vpn)``）；
     * ``targets``：必须 ACK 的核（本实现中恒为全部核）；
     * ``acks``：已 ACK 的核集合；
@@ -100,8 +108,10 @@ class TranslationResult:
 
     * 成功：``ok=True``，``fault=None``，``phys_addr`` 为物理地址；
     * 失败：``ok=False``，``fault`` 取值
-      ``"not_mapped" | "read" | "write" | "execute"``；
+      ``"not_mapped" | "read" | "write" | "execute" | "cow"``；
+      ``"cow"`` 表示写访问命中写时复制共享页，须显式处理写故障；
     * ``via``：``"tlb"``（命中缓存，可能是尚未 ACK 的旧项）或 ``"walk"``（遍历页表）。
+      COW 共享页不进 TLB，其访问恒为 ``"walk"``。
     """
 
     ok: bool
@@ -133,11 +143,26 @@ class WalkResult:
     perms: int
     huge: bool
     vaddr: int
+    cow: bool = False
 
     @property
     def phys_addr(self) -> int:
         off_mask = HUGE_PAGE_MASK if self.huge else PAGE_MASK
         return self.ppn * PAGE_SIZE + (self.vaddr & off_mask)
+
+
+@dataclass
+class CloneResult:
+    """:meth:`MMU.clone_address_space` 的返回。
+
+    * ``child_asid``：新克隆出的子地址空间 ASID；
+    * ``ticket``：父空间小页 key 的失效票据（克隆把父空间可写小页标记为 COW，
+      因此父空间各核 TLB 中可能存在的旧可写项必须失效；ACK 前旧项仍允许命中，
+      与既有“陈旧窗口”语义一致）。
+    """
+
+    child_asid: int
+    ticket: Ticket
 
 
 # ===========================================================================
@@ -162,7 +187,7 @@ class AddressSpace:
         pte = e[l2i]
         if pte is None:
             return None
-        return WalkResult(pte.ppn, pte.perms, False, vaddr)
+        return WalkResult(pte.ppn, pte.perms, False, vaddr, pte.cow)
 
     # ---- map ----------------------------------------------------------------
     def map_small(self, vaddr: int, perms: int) -> tuple[PTE, int]:
@@ -324,8 +349,8 @@ class MMU:
         return [t.id for t in self._tickets.values() if t.asid == asid and not t.closed]
 
     # ---- ASID 生命周期 ------------------------------------------------------
-    def create_address_space(self) -> int:
-        """分配一个新地址空间，返回 ASID（0..3）。
+    def _alloc_slot(self) -> int:
+        """挑一个可用 ASID 槽位（不安装空间）。
 
         * 4 个槽位全活动 -> :class:`AddressSpaceLimit`；
         * 空闲槽位若仍挂着未 finish 的票据 -> 该号不能复用；
@@ -342,10 +367,14 @@ class MMU:
             if pending:
                 busy.append(cand)
                 continue
-            sp = AddressSpace(cand, self.mem)
-            self._spaces[cand] = sp
             return cand
         raise AsidBusy(busy[0], self._pending_for_asid(busy[0]))
+
+    def create_address_space(self) -> int:
+        """分配一个新地址空间，返回 ASID（0..3）。槽位规则见 :meth:`_alloc_slot`。"""
+        asid = self._alloc_slot()
+        self._spaces[asid] = AddressSpace(asid, self.mem)
+        return asid
 
     def destroy_address_space(self, asid) -> None:
         """销毁地址空间。
@@ -364,6 +393,99 @@ class MMU:
                 del tlb[k]
         sp.destroy()
         del self._spaces[sp.asid]
+
+    # ---- 地址空间克隆（写时复制） --------------------------------------------
+    def clone_address_space(self, asid) -> CloneResult:
+        """克隆地址空间：小页共享 + 写时复制，大页深拷贝。
+
+        * **小页**：父子 PTE 指向同一物理帧，帧引用计数 +1，两侧 PTE 都打上
+          COW 标记；之后任一侧写入须先经 :meth:`handle_write_fault` 显式分裂。
+        * **大页**：不参与 COW 共享——克隆时为子空间分配新的 16 帧块并逐帧
+          复制内容（本题不做大页拆分，共享大页会让“局部 protect 拆分”语义
+          无法定义，故采用深拷贝）。
+        * 返回 :class:`CloneResult`：子空间 ASID + 父空间小页 key 的失效票据
+          （``kind="clone"``）。父空间在克隆前缓存的可写 TLB 项在 ACK 前仍允许
+          命中（陈旧窗口），全部 ACK + finish 后父空间写入才会报 ``cow`` fault。
+        * **失败原子性**：槽位不足（AddressSpaceLimit/AsidBusy）或帧池耗尽
+          （FrameExhausted）时，父空间页表、引用计数与帧占用完全不变，
+          不安装子空间、不产生票据。
+        """
+        sp = self._space(asid)
+        child_asid = self._alloc_slot()  # 先拿槽位：失败则什么都不做
+        child = AddressSpace(child_asid, self.mem)
+        # 阶段 1：构建子空间页表（唯一可能抛 FrameExhausted 的阶段）
+        allocated_huge: list[int] = []  # 已为子空间分配的大页基帧（回滚用）
+        retained: list[int] = []        # 已 retain 的小页帧（回滚用）
+        try:
+            for l1i, l1e in enumerate(sp.l1):
+                if isinstance(l1e, PTE):  # 大页：深拷贝 16 帧内容
+                    base = self.mem.alloc_huge()
+                    allocated_huge.append(base)
+                    for j in range(L2_SIZE):
+                        self.mem.buffer(base + j)[:] = self.mem.buffer(l1e.ppn + j)
+                    child.l1[l1i] = PTE(ppn=base, perms=l1e.perms, huge=True)
+                elif isinstance(l1e, list):  # 小页：共享帧，引用计数 +1
+                    table: list[PTE | None] = [None] * L2_SIZE
+                    for l2i, pte in enumerate(l1e):
+                        if pte is None:
+                            continue
+                        self.mem.retain_frame(pte.ppn)
+                        retained.append(pte.ppn)
+                        table[l2i] = PTE(ppn=pte.ppn, perms=pte.perms, cow=True)
+                    child.l1[l1i] = table
+        except FrameExhausted:
+            # 完整回滚：释放已分配的大页、退回已加的引用计数；父空间未被触碰
+            for base in allocated_huge:
+                self.mem.free_huge(base)
+            for ppn in retained:
+                self.mem.release_frame(ppn)
+            raise
+        # 阶段 2：提交——父空间小页标记 COW、安装子空间、发父空间失效票据
+        keys: list[tuple[int, int]] = []
+        for l1i, l1e in enumerate(sp.l1):
+            if isinstance(l1e, list):
+                for l2i, pte in enumerate(l1e):
+                    if pte is not None:
+                        pte.cow = True
+                        keys.append((sp.asid, l1i * L2_SIZE + l2i))
+        self._spaces[child_asid] = child
+        ticket = self._issue(sp.asid, "clone", 0, tuple(keys))
+        return CloneResult(child_asid=child_asid, ticket=ticket)
+
+    # ---- 显式写故障事件（COW 分裂） ------------------------------------------
+    def handle_write_fault(self, asid, vaddr) -> Ticket:
+        """显式、串行地处理一次 COW 写故障：把共享小页分裂为私有副本。
+
+        * 目标必须是处于 COW 共享状态的小页（256 对齐地址）；未映射抛
+          :class:`NotMapped`，大页或非 COW 页抛 :class:`InvalidWriteFault`。
+        * 成功路径：先分配新帧并复制源帧 256 字节内容，再解除旧帧引用
+          （计数 -1，归零时帧回收），最后换 PTE、清 COW 标记，返回该小页的
+          失效票据（``kind="cow"``）。
+        * 帧池耗尽抛 :class:`FrameExhausted`：此时**原映射保持**——PTE、
+          COW 标记、引用计数与帧内容都不变（先分配后改表，无部分变更）。
+        """
+        sp = self._space(asid)
+        va = validate_vaddr(vaddr, "vaddr")
+        if va & PAGE_MASK:
+            raise ValueError(f"handle_write_fault 要求 256 对齐，得到 vaddr=0x{va:x}")
+        l1i, l2i, _ = split_vaddr(va)
+        l1e = sp.l1[l1i]
+        if isinstance(l1e, PTE):
+            raise InvalidWriteFault(
+                f"vaddr=0x{va:x} 位于大页内：大页不参与写时复制（克隆时已深拷贝）"
+            )
+        if l1e is None or l1e[l2i] is None:
+            raise NotMapped(f"vaddr=0x{va:x} 没有映射，不能处理写故障")
+        pte = l1e[l2i]
+        if not pte.cow:
+            raise InvalidWriteFault(
+                f"vaddr=0x{va:x} 不是写时复制共享页（cow=False），无需处理写故障"
+            )
+        new_ppn = self.mem.alloc_cow_copy(pte.ppn)  # 失败则上面状态全不变
+        self.mem.release_frame(pte.ppn)
+        pte.ppn = new_ppn
+        pte.cow = False
+        return self._issue(sp.asid, "cow", va, self._keys_for(sp.asid, va, False))
 
     # ---- 票据 ---------------------------------------------------------------
     def _issue(self, asid: int, kind: str, vaddr: int, keys: tuple) -> Ticket:
@@ -516,22 +638,25 @@ class MMU:
         vpn = va >> PAGE_BITS
         entry, hit_key = self._lookup_tlb(core, sp.asid, vpn)
         via = "tlb"
+        cow = False
         if entry is None:
             wr = sp.walk(va)
             if wr is None:
                 return TranslationResult(False, None, "not_mapped", access.name.lower(),
                                          "walk", sp.asid, va)
             entry = (wr.ppn, wr.perms, wr.huge)
+            cow = wr.cow
             via = "walk"
-            # 填入 TLB：大页用 16 对齐的标记 key
-            key = (sp.asid, vpn if not wr.huge else (vpn & ~(L2_SIZE - 1)))
-            tlb = self._tlb[core]
-            if key in tlb:
-                tlb.move_to_end(key)
-            else:
-                tlb[key] = entry
-                if len(tlb) > TLB_SIZE:
-                    tlb.popitem(last=False)
+            if not cow:
+                # COW 共享页不进 TLB：写访问必须每次都走页表，才能稳定报 cow fault
+                key = (sp.asid, vpn if not wr.huge else (vpn & ~(L2_SIZE - 1)))
+                tlb = self._tlb[core]
+                if key in tlb:
+                    tlb.move_to_end(key)
+                else:
+                    tlb[key] = entry
+                    if len(tlb) > TLB_SIZE:
+                        tlb.popitem(last=False)
 
         ppn, perms, huge = entry
         region = HUGE_PAGE_SIZE if huge else PAGE_SIZE
@@ -544,9 +669,69 @@ class MMU:
         if not (perms & need):
             fault = {PERM_READ: "read", PERM_WRITE: "write", PERM_EXEC: "execute"}[need]
             return TranslationResult(False, None, fault, access.name.lower(), via, sp.asid, va, perms)
+        if cow and access == AccessType.WRITE:
+            # 写时复制共享页：权限允许写，但帧被共享——报显式写故障
+            return TranslationResult(False, None, "cow", access.name.lower(),
+                                     via, sp.asid, va, perms)
         off = va & (HUGE_PAGE_MASK if huge else PAGE_MASK)
         return TranslationResult(True, ppn * PAGE_SIZE + off, None, access.name.lower(),
                                  via, sp.asid, va, perms)
+
+    # ---- 字节内容访问（绕过 TLB，直接按页表；供测试/演示核对 COW 语义） ------
+    def _resolve_for_bytes(self, asid, vaddr, length: int, need: int) -> tuple[AddressSpace, int, WalkResult]:
+        sp = self._space(asid)
+        va = validate_vaddr(vaddr, "vaddr")
+        n = validate_size(length, "length")
+        if va + n - 1 > VADDR_MAX:
+            raise ValueError(f"访问区间末端 0x{va + n - 1:x} 超出虚拟地址空间")
+        wr = sp.walk(va)
+        if wr is None:
+            raise MemoryAccessFault("not_mapped", sp.asid, va)
+        region = HUGE_PAGE_SIZE if wr.huge else PAGE_SIZE
+        if (va & (region - 1)) + n > region:
+            raise CrossPageAccess(
+                f"vaddr=0x{va:x} length={n} 跨越了{'大页' if wr.huge else '小页'}边界"
+                f"（{'4096' if wr.huge else '256'} 字节）"
+            )
+        if not (wr.perms & need):
+            fault = "read" if need == PERM_READ else "write"
+            raise MemoryAccessFault(fault, sp.asid, va)
+        return sp, va, wr
+
+    def read_bytes(self, asid, vaddr, length: int = 1) -> bytes:
+        """按页表读取 ``length`` 字节内容（不经过 TLB）。
+
+        未映射 / 无读权限抛 :class:`MemoryAccessFault`；跨页抛
+        :class:`CrossPageAccess`。COW 共享页可读（读不触发分裂）。
+        """
+        sp, va, wr = self._resolve_for_bytes(asid, vaddr, length, PERM_READ)
+        off = va & (HUGE_PAGE_MASK if wr.huge else PAGE_MASK)
+        return self.mem.read_phys(wr.ppn * PAGE_SIZE + off, length)
+
+    def write_bytes(self, asid, vaddr, data) -> int:
+        """按页表写入 bytes-like 内容（不经过 TLB），返回写入字节数。
+
+        * 未映射 / 无写权限抛 :class:`MemoryAccessFault`；跨页抛
+          :class:`CrossPageAccess`；
+        * 命中 COW 共享页抛 ``MemoryAccessFault(fault="cow")``——
+          写共享页前必须显式调用 :meth:`handle_write_fault` 分裂；
+        * 单次写入不得跨页（小页 256 / 大页 4096 边界）。
+        """
+        va = validate_vaddr(vaddr, "vaddr")
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            payload = bytes(data)
+        else:
+            raise TypeError(f"data 必须是 bytes-like，得到 {type(data).__name__}")
+        if not payload:
+            raise ValueError("data 不能为空")
+        if len(payload) > HUGE_PAGE_SIZE:
+            raise ValueError(f"data 长度 {len(payload)} 超过单次最大 {HUGE_PAGE_SIZE}")
+        sp, va, wr = self._resolve_for_bytes(asid, va, len(payload), PERM_WRITE)
+        if wr.cow:
+            raise MemoryAccessFault("cow", sp.asid, va)
+        off = va & (HUGE_PAGE_MASK if wr.huge else PAGE_MASK)
+        self.mem.write_phys(wr.ppn * PAGE_SIZE + off, payload)
+        return len(payload)
 
     # ---- 诊断 ---------------------------------------------------------------
     def mappings(self, asid) -> list[tuple[int, int, int, bool]]:

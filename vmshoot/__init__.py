@@ -20,9 +20,21 @@
 6. 被销毁/重建的 ASID 号在仍有未 finish 票据时不能复用（:class:`AsidBusy`）。
 
 翻译：:meth:`MMU.translate` 返回 :class:`TranslationResult`，成功给物理地址，
-失败给 ``not_mapped/read/write/execute`` fault；一次访问跨越所在页边界抛
+失败给 ``not_mapped/read/write/execute/cow`` fault；一次访问跨越所在页边界抛
 :class:`CrossPageAccess`。另有 :meth:`MMU.walk_table` 作为“无 TLB 遍历器”
 供验收在全部 ACK 后核对。
+
+地址空间克隆与写时复制（COW）：
+
+* :meth:`MMU.clone_address_space` 克隆整个地址空间：**小页共享**同一物理帧
+  （帧引用计数 +1，父子 PTE 都打 COW 标记），**大页深拷贝**（新帧 + 内容复制）；
+  返回 :class:`CloneResult`（子 ASID + 父空间失效票据）。
+* 对 COW 共享页的写访问报 ``cow`` fault；:meth:`MMU.handle_write_fault` 是
+  **显式、串行**的写故障事件：分配新帧、复制 256 字节内容、解除旧帧引用
+  （计数归零时帧回收），然后换 PTE 并发出失效票据。解除映射只减引用计数，
+  最后一个引用消失时帧才真正回收。
+* :meth:`MMU.read_bytes` / :meth:`MMU.write_bytes` 按页表做字节级内容访问，
+  用于核对共享/分裂前后的页内容。
 """
 
 from __future__ import annotations
@@ -31,6 +43,7 @@ from .core import (
     MMU,
     AddressSpace,
     AccessType,
+    CloneResult,
     PTE,
     Ticket,
     TranslationResult,
@@ -44,8 +57,10 @@ from .errors import (
     FrameExhausted,
     InvalidAddressSpace,
     InvalidationsPending,
+    InvalidWriteFault,
     MappingConflict,
     MappingExists,
+    MemoryAccessFault,
     NotMapped,
     TicketError,
 )
@@ -79,6 +94,7 @@ __all__ = [
     "Ticket",
     "TranslationResult",
     "WalkResult",
+    "CloneResult",
     # 常量
     "PAGE_SIZE",
     "HUGE_PAGE_SIZE",
@@ -104,10 +120,12 @@ __all__ = [
     "FrameExhausted",
     "InvalidAddressSpace",
     "InvalidationsPending",
+    "InvalidWriteFault",
     "MappingConflict",
     "MappingExists",
+    "MemoryAccessFault",
     "NotMapped",
     "TicketError",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

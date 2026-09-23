@@ -67,3 +67,28 @@ class TicketError(VMShootError):
 
 class CrossPageAccess(VMShootError):
     """一次访问跨越了其所在映射页（小页 256B / 大页 4096B）的边界，按契约拒绝。"""
+
+
+class InvalidWriteFault(VMShootError):
+    """对一个**不是**写时复制共享状态的小页显式请求写故障处理。
+
+    写故障是显式串行事件（:meth:`MMU.handle_write_fault`）：目标必须存在且当前
+    正处于 COW 共享状态；未映射抛 :class:`NotMapped`，大页/私有页抛本异常。
+    """
+
+
+class MemoryAccessFault(VMShootError):
+    """:meth:`MMU.read_bytes` / :meth:`MMU.write_bytes` 时访问未成功。
+
+    ``fault`` 取值与 :class:`~vmshoot.TranslationResult` 一致：
+    ``"not_mapped" | "read" | "write" | "execute" | "cow"``；
+    其中 ``"cow"`` 表示命中写时复制共享页，必须先显式处理写故障再写。
+    """
+
+    def __init__(self, fault: str, asid: int, vaddr: int):
+        self.fault = fault
+        self.asid = asid
+        self.vaddr = vaddr
+        super().__init__(
+            f"ASID {asid} vaddr=0x{vaddr:x} 的字节访问失败：fault={fault}"
+        )
