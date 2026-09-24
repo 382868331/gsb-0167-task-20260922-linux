@@ -22,6 +22,7 @@ from .errors import (
 )
 from .memory import PhysicalMemory
 from .primitives import (
+    HUGE_BITS,
     HUGE_PAGE_MASK,
     HUGE_PAGE_SIZE,
     L1_SIZE,
@@ -36,6 +37,7 @@ from .primitives import (
     PERM_WRITE,
     TLB_SIZE,
     VADDR_MAX,
+    VADDR_SPACE,
     perm_to_str,
     split_vaddr,
     validate_int,
@@ -69,7 +71,7 @@ class PTE:
 class Ticket:
     """失效票据。
 
-    * ``kind``：``map`` / ``unmap`` / ``protect``；
+    * ``kind``：``map`` / ``unmap`` / ``protect`` / ``protect_range``；
     * ``keys``：需要失效的 TLB key（小页粒度的 ``(asid, vpn)``）；
     * ``targets``：必须 ACK 的核（本实现中恒为全部核）；
     * ``acks``：已 ACK 的核集合；
@@ -262,6 +264,64 @@ class AddressSpace:
         table[l2i].perms = perms
         self.l1[l1i] = table
         return table, l2i
+
+    # ---- 范围 protect -------------------------------------------------------
+    def protect_range(self, start: int, end: int, perms: int) -> list[tuple[int, bool, int, int]]:
+        """把半开区间 ``[start, end)`` 覆盖的所有小页权限改为 ``perms``。
+
+        两阶段执行：
+
+        1. **全量校验**：区间内任何一个 256 字节页未映射即抛 :class:`NotMapped`，
+           此时页表完全不变（不存在部分变更）；
+        2. **应用**：只做指针/权限改写，不分配也不释放帧，因此不会中途失败。
+           整段覆盖的大页保留大页形式直接改权限；部分覆盖的大页就地拆成
+           16 个小页（同一批帧，物理地址不变），仅区间内页面用新权限。
+
+        前置（调用方已校验）：``start``/``end`` 256 对齐且 ``start < end``。
+        返回触及的 ``(l1 下标, 原为大页, 覆盖起点, 覆盖终点)`` 列表（按地址
+        升序），供 MMU 生成失效 key。
+        """
+        touched: list[tuple[int, bool, int, int]] = []
+        for l1i in range(start >> HUGE_BITS, ((end - 1) >> HUGE_BITS) + 1):
+            region = l1i * HUGE_PAGE_SIZE
+            lo = max(start, region)
+            hi = min(end, region + HUGE_PAGE_SIZE)
+            l1e = self.l1[l1i]
+            if isinstance(l1e, PTE):
+                touched.append((l1i, True, lo, hi))
+            elif isinstance(l1e, list):
+                for j in range((lo - region) >> PAGE_BITS, (hi - region) >> PAGE_BITS):
+                    if l1e[j] is None:
+                        raise NotMapped(
+                            f"区间 [0x{start:x}, 0x{end:x}) 在 vaddr="
+                            f"0x{region + j * PAGE_SIZE:x} 处遇到未映射空洞"
+                        )
+                touched.append((l1i, False, lo, hi))
+            else:
+                raise NotMapped(
+                    f"区间 [0x{start:x}, 0x{end:x}) 在 vaddr=0x{region:x} 处"
+                    "遇到未映射空洞（整个大页区域无映射）"
+                )
+        for l1i, was_huge, lo, hi in touched:
+            region = l1i * HUGE_PAGE_SIZE
+            l1e = self.l1[l1i]
+            j0 = (lo - region) >> PAGE_BITS
+            j1 = (hi - region) >> PAGE_BITS
+            if was_huge:
+                if j0 == 0 and j1 == L2_SIZE:
+                    l1e.perms = perms  # 整段大页统一改权限，保留大页形式
+                else:
+                    table = [
+                        PTE(ppn=l1e.ppn + j, perms=l1e.perms, huge=False)
+                        for j in range(L2_SIZE)
+                    ]
+                    for j in range(j0, j1):
+                        table[j].perms = perms
+                    self.l1[l1i] = table
+            else:
+                for j in range(j0, j1):
+                    l1e[j].perms = perms
+        return touched
 
     # ---- 销毁 ---------------------------------------------------------------
     def destroy(self) -> None:
@@ -463,6 +523,48 @@ class MMU:
             )
         sp.protect_small(va, p)
         return self._issue(sp.asid, "protect", va, self._keys_for(sp.asid, va, False))
+
+    def protect_range(self, asid, start, end, perms) -> Ticket:
+        """把半开区间 ``[start, end)`` 的访问权限统一改为 ``perms``。
+
+        * ``start``/``end`` 必须按 256 字节小页对齐，``start < end``，
+          ``end`` 最大为 ``0x10000``（半开区间终点可等于地址空间大小）；
+        * 区间覆盖的每一个小页都必须已有映射，否则抛 :class:`NotMapped`；
+          任何非法参数或空洞都在**任何变更之前**报错——页表、票据、TLB
+          均保持原状，不存在部分变更；
+        * 物理地址与帧占用不变；同一物理页在其他虚拟地址（或其他 ASID）的
+          别名映射不随之改权限；
+        * 整段覆盖的大页保留大页形式；部分覆盖的大页就地拆成 16 个小页，
+          仅区间内页面改权限（不要求把后来相同权限的小页重新合并）；
+        * 成功后返回**一张**失效票据，沿用既有 ack/finish 协议：触及过大页
+          的区域列出该区域全部 16 个小页 key（含大页标记 key），其余每页
+          一个 key。
+        """
+        sp = self._space(asid)
+        s = validate_vaddr(start, "start")
+        e = validate_int(end, "end", max_value=VADDR_SPACE)
+        p = validate_perms(perms, "perms")
+        if s & PAGE_MASK:
+            raise ValueError(f"start=0x{s:x} 未按 256 字节小页对齐")
+        if e & PAGE_MASK:
+            raise ValueError(f"end=0x{e:x} 未按 256 字节小页对齐")
+        if s >= e:
+            raise ValueError(f"区间为空或反向：start=0x{s:x} end=0x{e:x}")
+        touched = sp.protect_range(s, e, p)  # 内部先全量校验空洞，再应用
+        keys: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for l1i, was_huge, lo, hi in touched:
+            if was_huge:
+                cand = self._keys_for(sp.asid, l1i * HUGE_PAGE_SIZE, True)
+            else:
+                cand = tuple(
+                    (sp.asid, va >> PAGE_BITS) for va in range(lo, hi, PAGE_SIZE)
+                )
+            for k in cand:
+                if k not in seen:
+                    seen.add(k)
+                    keys.append(k)
+        return self._issue(sp.asid, "protect_range", s, tuple(keys))
 
     # ---- TLB ----------------------------------------------------------------
     def tlb_keys(self, core_id) -> list[tuple[int, int]]:

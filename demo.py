@@ -7,6 +7,8 @@
 2. unmap 的失效票据：ACK 前双核陈旧 TLB 项仍可见、finish 被阻塞，
    全部 ACK + finish 后翻译变为 not_mapped；
 3. 大页中间改权限：ACK 前陈旧写仍成功，ACK 后目标页 write fault、邻页保持 rwx；
+3b/3c. protect_range 范围改权限：两个核先缓存旧权限，部分大页降权后逐核
+   ACK、最终拒绝写入；整段大页统一改权限保留大页形式；
 4. 真实触发的边界：跨页访问抛 CrossPageAccess；未完成票据阻塞 ASID 复用 (AsidBusy)。
 """
 
@@ -21,6 +23,7 @@ from vmshoot import (
     InvalidationsPending,
     PERM_RW,
     PERM_RWX,
+    PERM_RX,
     PERM_READ,
     perm_to_str,
 )
@@ -110,6 +113,55 @@ def main() -> None:
     print(f"  无 TLB 遍历器核对：0x1000 -> {w_gone}；"
           f"0x4300 -> ppn={w_tgt.ppn} perms={perm_to_str(w_tgt.perms)} huge={w_tgt.huge}；"
           f"0x4f00 -> perms={perm_to_str(w_other.perms)}")
+
+    # ---- 3b. 范围改权限：部分大页降权（protect_range） ---------------------
+    hr("3b. protect_range：两个核先缓存旧权限，部分大页降权后逐核确认")
+    t_h2 = mmu.map(asid, 0x8000, PERM_RWX, huge=True)
+    settle(mmu, t_h2)
+    print("  map 大页 @0x8000 rwx（票据已完成）")
+    for core in (0, 1):
+        mmu.translate(asid, core, 0x8600, AccessType.WRITE)  # 双核缓存旧权限
+    print("  核0/核1 均已把 0x8600 的旧权限（rwx）缓存进各自 TLB")
+    phys_before = mmu.walk_table(asid, 0x8600).phys_addr
+    tr = mmu.protect_range(asid, 0x8500, 0x8700, PERM_READ)
+    print(f"  protect_range [0x8500, 0x8700) rwx->r--：大页就地拆成 16 小页，"
+          f"票据 #{tr.id}（kind={tr.kind}）覆盖 {len(tr.keys)} 个失效 key；"
+          f"物理地址 0x{phys_before:04x} 不变")
+    show("[失效前] 核0 写 0x8600（旧 TLB 项仍放行）",
+         mmu.translate(asid, 0, 0x8600, AccessType.WRITE))
+    show("[失效前] 核1 写 0x8600（旧 TLB 项仍放行）",
+         mmu.translate(asid, 1, 0x8600, AccessType.WRITE))
+    try:
+        mmu.finish(tr.id)
+    except InvalidationsPending as e:
+        print(f"  finish 被阻塞：{e}")
+    mmu.ack(0, tr.id)
+    print("  核0 已 ACK -> 其 TLB 旧项移除")
+    show("[核0 ACK] 核0 写 0x8600（立即拒绝）",
+         mmu.translate(asid, 0, 0x8600, AccessType.WRITE))
+    show("[核0 ACK] 核1 写 0x8600（未 ACK，仍旧放行）",
+         mmu.translate(asid, 1, 0x8600, AccessType.WRITE))
+    mmu.ack(1, tr.id)
+    mmu.finish(tr.id)
+    print("  核1 已 ACK；finish 成功——此后任何旧 TLB 权限都不能再放行写")
+    show("[全部 ACK] 核1 写 0x8600（最终拒绝）",
+         mmu.translate(asid, 1, 0x8600, AccessType.WRITE))
+    show("[全部 ACK] 核1 读 0x8600（只读仍允许）",
+         mmu.translate(asid, 1, 0x8600, AccessType.READ))
+    show("[全部 ACK] 核0 写 0x8800（区间外邻居保持 rwx）",
+         mmu.translate(asid, 0, 0x8800, AccessType.WRITE))
+
+    # ---- 3c. 整段大页统一改权限：保留大页形式 ------------------------------
+    hr("3c. protect_range 整段覆盖大页：保留大页形式")
+    t_h3 = mmu.map(asid, 0xC000, PERM_RWX, huge=True)
+    settle(mmu, t_h3)
+    tr2 = mmu.protect_range(asid, 0xC000, 0xD000, PERM_RX)
+    settle(mmu, tr2)
+    w = mmu.walk_table(asid, 0xC800)
+    print(f"  protect_range [0xc000, 0xd000) rwx->r-x：huge={w.huge}（保留大页），"
+          f"perms={perm_to_str(w.perms)}")
+    show("核0 写 0xc800（降权后拒绝）", mmu.translate(asid, 0, 0xC800, AccessType.WRITE))
+    show("核0 取指 0xc800（r-x 允许）", mmu.translate(asid, 0, 0xC800, AccessType.EXECUTE))
 
     # ---- 4a. 真实触发的拒绝：跨页访问 -------------------------------------
     hr("4. 真实触发的拒绝/异常边界")
