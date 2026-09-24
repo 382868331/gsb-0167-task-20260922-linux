@@ -9,7 +9,7 @@
 * 最多 4 个活动地址空间（ASID 0..3）。物理内存只是 Python 内的位图模拟，
   不调用任何 OS 映射（无 mmap）。
 
-失效协议（map/unmap/protect）：
+失效协议（map/unmap/protect/protect_range）：
 
 1. 先更新页表；
 2. 产生一张 :class:`Ticket`，列出需要失效的 TLB key 与全部目标核；

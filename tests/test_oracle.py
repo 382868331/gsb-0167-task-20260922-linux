@@ -187,6 +187,51 @@ class RefMMU:
         e[l2i] = (e[l2i][0], perms)
         return self.issue(asid, "protect", va, self.keys_for(asid, va, False))
 
+    def protect_range(self, asid, start, end, perms) -> int:
+        """范围权限修改的独立参考实现（与被测核心不共享代码）。"""
+        if start & 0xFF or end & 0xFF:
+            raise ValueError("align")
+        if end <= start or end > 0x10000:
+            raise ValueError("range")
+        l1 = self.spaces[asid]
+        lo_l1, hi_l1 = start >> 12, (end - 1) >> 12
+        # 预检：任何修改之前
+        for l1i in range(lo_l1, hi_l1 + 1):
+            e = l1[l1i]
+            if e is None:
+                raise NotMapped("ref hole")
+            if isinstance(e, list):
+                lo = max(start, l1i << 12)
+                hi = min(end, (l1i + 1) << 12)
+                a, b = (lo >> 8) & 15, ((hi - 1) >> 8) & 15
+                for l2i in range(a, b + 1):
+                    if e[l2i] is None:
+                        raise NotMapped("ref hole")
+        # 应用
+        for l1i in range(lo_l1, hi_l1 + 1):
+            lo = max(start, l1i << 12)
+            hi = min(end, (l1i + 1) << 12)
+            a, b = (lo >> 8) & 15, ((hi - 1) >> 8) & 15
+            e = l1[l1i]
+            if isinstance(e, tuple):
+                _, base, old_perms = e
+                if a == 0 and b == 15:
+                    l1[l1i] = ("H", base, perms)      # 整段大页：保留大页形式
+                else:
+                    table = [(base + j, old_perms) for j in range(16)]
+                    for l2i in range(a, b + 1):
+                        table[l2i] = (base + l2i, perms)
+                    l1[l1i] = table
+            else:
+                for l2i in range(a, b + 1):
+                    e[l2i] = (e[l2i][0], perms)
+        keys = tuple(
+            (asid, l1i * 16 + j)
+            for l1i in range(lo_l1, hi_l1 + 1)
+            for j in range(16)
+        )
+        return self.issue(asid, "protect_range", start, keys)
+
     # ---- 票据 -----------------------------------------------------------
     def ack(self, core, tid) -> None:
         t = self.tickets.get(tid)
@@ -373,12 +418,20 @@ class TestDifferential(unittest.TestCase):
                     a = rng.choice(active)
                     self._cmp_ticket(
                         lambda m, a=a, va=self._small_va(rng): m.unmap(a, va), sut, ref)
-                elif r < 0.62 and active:
+                elif r < 0.56 and active:
                     a = rng.choice(active)
                     va = self._small_va(rng)
                     perms = rng.choice(PERMS_CHOICES)
                     self._cmp_ticket(
                         lambda m, a=a, va=va, p=perms: m.protect(a, va, p), sut, ref)
+                elif r < 0.66 and active:
+                    a = rng.choice(active)
+                    i, j = rng.randrange(256), rng.randrange(256)
+                    start, end = min(i, j) * 256, (max(i, j) + 1) * 256
+                    perms = rng.choice(PERMS_CHOICES)
+                    self._cmp_ticket(
+                        lambda m, a=a, s=start, e=end, p=perms:
+                            m.protect_range(a, s, e, p), sut, ref)
                 elif r < 0.88 and active:
                     a = rng.choice(active)
                     core = rng.randrange(2)

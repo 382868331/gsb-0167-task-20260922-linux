@@ -22,6 +22,7 @@ from .errors import (
 )
 from .memory import PhysicalMemory
 from .primitives import (
+    HUGE_BITS,
     HUGE_PAGE_MASK,
     HUGE_PAGE_SIZE,
     L1_SIZE,
@@ -36,6 +37,7 @@ from .primitives import (
     PERM_WRITE,
     TLB_SIZE,
     VADDR_MAX,
+    VADDR_SPACE,
     perm_to_str,
     split_vaddr,
     validate_int,
@@ -69,7 +71,7 @@ class PTE:
 class Ticket:
     """失效票据。
 
-    * ``kind``：``map`` / ``unmap`` / ``protect``；
+    * ``kind``：``map`` / ``unmap`` / ``protect`` / ``protect_range``；
     * ``keys``：需要失效的 TLB key（小页粒度的 ``(asid, vpn)``）；
     * ``targets``：必须 ACK 的核（本实现中恒为全部核）；
     * ``acks``：已 ACK 的核集合；
@@ -262,6 +264,74 @@ class AddressSpace:
         table[l2i].perms = perms
         self.l1[l1i] = table
         return table, l2i
+
+    # ---- protect_range ------------------------------------------------------
+    def protect_range_pages(self, start: int, end: int, perms: int) -> tuple[int, ...]:
+        """把半开区间 ``[start, end)``（均已 256 对齐）内所有小页的权限改为 ``perms``。
+
+        规则：
+
+        * 先对区间覆盖的每个 4096 区域做完整预检（空洞 -> :class:`NotMapped`），
+          全部通过后才修改任何页表项——本方法不分配/释放帧，预检之后不可能失败，
+          因此失败时页表、帧占用均无任何部分变更；
+        * 被区间**完整覆盖**的大页：只改权限、保留大页形式（不隐式拆分）；
+        * 被区间**部分覆盖**的大页：就地拆成 16 个小页（帧不变），只把区间内
+          小页改为新权限，区间外小页保留原权限；
+        * 小页表区域：区间内已映射小页改权限。
+
+        物理帧号一律不变；同一物理帧在其他虚拟页上的别名 PTE 不随之改权限。
+        返回“修改后仍为大页形式”的 L1 区域下标元组（供票据失效 key 计算）。
+        """
+        l1_lo = start >> HUGE_BITS
+        l1_hi = (end - 1) >> HUGE_BITS
+        # ---- 预检：任何修改之前 -------------------------------------------
+        for l1i in range(l1_lo, l1_hi + 1):
+            region_lo = max(start, l1i << HUGE_BITS)
+            region_hi = min(end, (l1i + 1) << HUGE_BITS)
+            l1e = self.l1[l1i]
+            if l1e is None:
+                raise NotMapped(
+                    f"区间 [0x{start:x}, 0x{end:x}) 在 0x{region_lo:x} 处遇到未映射空洞"
+                )
+            if isinstance(l1e, list):
+                lo_l2 = (region_lo >> PAGE_BITS) & (L2_SIZE - 1)
+                hi_l2 = ((region_hi - 1) >> PAGE_BITS) & (L2_SIZE - 1)
+                for l2i in range(lo_l2, hi_l2 + 1):
+                    if l1e[l2i] is None:
+                        raise NotMapped(
+                            f"区间 [0x{start:x}, 0x{end:x}) 在 0x{(l1i << HUGE_BITS) + (l2i << PAGE_BITS):x} 处遇到未映射空洞"
+                        )
+        # ---- 应用：预检全部通过，以下不会失败 --------------------------------
+        kept_huge: list[int] = []
+        for l1i in range(l1_lo, l1_hi + 1):
+            region_lo = max(start, l1i << HUGE_BITS)
+            region_hi = min(end, (l1i + 1) << HUGE_BITS)
+            lo_l2 = (region_lo >> PAGE_BITS) & (L2_SIZE - 1)
+            hi_l2 = ((region_hi - 1) >> PAGE_BITS) & (L2_SIZE - 1)
+            l1e = self.l1[l1i]
+            if isinstance(l1e, PTE):
+                if lo_l2 == 0 and hi_l2 == L2_SIZE - 1:
+                    l1e.perms = perms          # 整段大页统一改权限：保留大页形式
+                    kept_huge.append(l1i)
+                else:
+                    self.split_huge_region(l1i, lo_l2, hi_l2, perms)
+            else:
+                for l2i in range(lo_l2, hi_l2 + 1):
+                    l1e[l2i].perms = perms
+        return tuple(kept_huge)
+
+    def split_huge_region(self, l1i: int, lo_l2: int, hi_l2: int, perms: int) -> None:
+        """把 L1 区域 ``l1i`` 上的大页就地拆成 16 个小页，只把 ``[lo_l2, hi_l2]``
+        下标内的小页改为 ``perms``，其余保留原权限。帧不变、无资源分配。"""
+        l1e = self.l1[l1i]
+        assert isinstance(l1e, PTE) and l1e.huge
+        table = [
+            PTE(ppn=l1e.ppn + j, perms=l1e.perms, huge=False)
+            for j in range(L2_SIZE)
+        ]
+        for l2i in range(lo_l2, hi_l2 + 1):
+            table[l2i].perms = perms
+        self.l1[l1i] = table
 
     # ---- 销毁 ---------------------------------------------------------------
     def destroy(self) -> None:
@@ -463,6 +533,52 @@ class MMU:
             )
         sp.protect_small(va, p)
         return self._issue(sp.asid, "protect", va, self._keys_for(sp.asid, va, False))
+
+    def protect_range(self, asid, start, end, perms) -> Ticket:
+        """把半开虚拟地址区间 ``[start, end)`` 内所有已映射页的权限改为 ``perms``。
+
+        * ``start``/``end`` 均须 256 对齐，``0 <= start < end <= 0x10000``；
+          区间内每个 256 小页都必须已有映射，否则抛 :class:`NotMapped`；
+        * **原子性**：所有参数与“区间无空洞”的预检都先于任何修改完成；失败时
+          页表、TLB、票据均不发生任何变化（也不会产生新票据）；
+        * 被区间完整覆盖的大页保留大页形式、只改权限；部分覆盖的大页就地拆成
+          16 个小页，只替换区间内权限；物理地址不变，同一物理页在别处的别名
+          映射不随之改权限；
+        * 失效走既有票据协议：返回**一张**票据（``kind="protect_range"``），
+          其 keys 覆盖区间内全部小页 key（凡本次触及的 4096 区域一律列出该区域
+          全部 16 个小页 key，以精确失效拆分前可能缓存的大页标记项）；调用方用
+          既有的 :meth:`ack` / :meth:`finish` 完成确认，没有第二套确认机制。
+        """
+        sp = self._space(asid)
+        s = validate_vaddr(start, "start")
+        e = validate_int(end, "end", max_value=VADDR_SPACE)
+        p = validate_perms(perms, "perms")
+        if s & PAGE_MASK:
+            raise ValueError(f"protect_range 要求 start 256 对齐，得到 start=0x{s:x}")
+        if e & PAGE_MASK:
+            raise ValueError(f"protect_range 要求 end 256 对齐，得到 end=0x{e:x}")
+        if e <= s:
+            raise ValueError(
+                f"protect_range 要求 start < end（半开区间非空），得到 "
+                f"start=0x{s:x} end=0x{e:x}"
+            )
+        sp.protect_range_pages(s, e, p)
+        keys = self._keys_for_range(sp.asid, s, e)
+        return self._issue(sp.asid, "protect_range", s, keys)
+
+    @staticmethod
+    def _keys_for_range(asid: int, start: int, end: int) -> tuple[tuple[int, int], ...]:
+        """范围失效 key：每个被触及的 4096 区域一律列出 16 个小页 key。
+
+        保留大页形式的区域同样需要 16 个 key：ACK 前其他核可能已缓存该区域
+        任意小页位置上的大页标记项（key 为 16 对齐 vpn），只列区间内 key 会漏掉
+        区间外小页上的陈旧大页项。
+        """
+        keys: list[tuple[int, int]] = []
+        for l1i in range(start >> HUGE_BITS, ((end - 1) >> HUGE_BITS) + 1):
+            base_vpn = l1i * L2_SIZE
+            keys.extend((asid, base_vpn + j) for j in range(L2_SIZE))
+        return tuple(keys)
 
     # ---- TLB ----------------------------------------------------------------
     def tlb_keys(self, core_id) -> list[tuple[int, int]]:
