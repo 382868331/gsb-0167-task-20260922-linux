@@ -187,6 +187,71 @@ class RefMMU:
         e[l2i] = (e[l2i][0], perms)
         return self.issue(asid, "protect", va, self.keys_for(asid, va, False))
 
+    def remap(self, asid, src, dst, size) -> int:
+        """参考实现的区间平移：dict/list 直写，与被测代码不共享算法。"""
+        if src & 0xFF:
+            raise ValueError("ref src align")
+        if dst & 0xFF:
+            raise ValueError("ref dst align")
+        if size <= 0 or size & 0xFF:
+            raise ValueError("ref size")
+        if src + size > 0x10000:
+            raise ValueError("ref src range")
+        if dst + size > 0x10000:
+            raise ValueError("ref dst range")
+        if src < dst + size and dst < src + size:
+            raise MappingConflict("ref overlap")
+        l1 = self.spaces[asid]
+        # 只读预检：源无洞、目标全空（失败时什么都不改）
+        for off in range(0, size, 256):
+            if self.walk(asid, src + off) is None:
+                raise NotMapped("ref hole")
+        for off in range(0, size, 256):
+            if self.walk(asid, dst + off) is not None:
+                raise MappingExists("ref dst busy")
+        # 应用：整段对齐的大页保持，其余大页就地拆小后逐页搬
+        end = src + size
+        kept = []
+        h = src & ~0xFFF
+        while h < end:
+            e = l1[h >> 12]
+            if isinstance(e, tuple):
+                _, base, perms = e
+                dst_h = dst + (h - src)
+                if h >= src and h + 4096 <= end and dst_h % 4096 == 0:
+                    kept.append((h, dst_h))
+                else:
+                    l1[h >> 12] = [(base + j, perms) for j in range(16)]
+            h += 4096
+        moved = set()
+        for h_src, h_dst in kept:
+            l1[h_dst >> 12] = l1[h_src >> 12]
+            l1[h_src >> 12] = None
+            moved.add(h_src)
+        for off in range(0, size, 256):
+            s = src + off
+            if (s & ~0xFFF) in moved:
+                continue
+            d = dst + off
+            sl1, sl2 = (s >> 12) & 0xF, (s >> 8) & 0xF
+            dl1, dl2 = (d >> 12) & 0xF, (d >> 8) & 0xF
+            pte = l1[sl1][sl2]
+            l1[sl1][sl2] = None
+            if l1[dl1] is None:
+                l1[dl1] = [None] * 16
+            l1[dl1][dl2] = pte
+            if all(x is None for x in l1[sl1]):
+                l1[sl1] = None
+        # 失效 key：源+目标小页 vpn ∪ 两区间触及的 4096 区域标记 vpn，升序
+        vpns = set()
+        for base in (src, dst):
+            vpns.update(range(base >> 8, (base + size) >> 8))
+            h = base & ~0xFFF
+            while h < base + size:
+                vpns.add(h >> 8)
+                h += 4096
+        return self.issue(asid, "remap", src, tuple((asid, v) for v in sorted(vpns)))
+
     # ---- 票据 -----------------------------------------------------------
     def ack(self, core, tid) -> None:
         t = self.tickets.get(tid)
@@ -379,7 +444,16 @@ class TestDifferential(unittest.TestCase):
                     perms = rng.choice(PERMS_CHOICES)
                     self._cmp_ticket(
                         lambda m, a=a, va=va, p=perms: m.protect(a, va, p), sut, ref)
-                elif r < 0.88 and active:
+                elif r < 0.72 and active:
+                    a = rng.choice(active)
+                    src = self._small_va(rng)
+                    dst = self._small_va(rng)
+                    size = rng.choice([256, 512, 768, 4096, 8192])
+                    self._cmp_ticket(
+                        lambda m, a=a, s=src, d=dst, n=size:
+                            m.remap(a, s, d, n) if isinstance(m, RefMMU)
+                            else m.remap_range(a, s, d, n), sut, ref)
+                elif r < 0.90 and active:
                     a = rng.choice(active)
                     core = rng.randrange(2)
                     va = rng.randrange(0x10000)

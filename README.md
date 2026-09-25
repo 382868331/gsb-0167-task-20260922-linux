@@ -16,11 +16,11 @@
 在仓库根目录（本文件所在目录）执行：
 
 ```bash
-# 全部必要测试（57 个）
-python -m unittest discover -s tests -v
+# 全部必要测试（74 个）
+./.venv/bin/python -m unittest discover -s tests -v
 
-# 固定输入演示（约 0.04 秒，远低于 8 秒；无 sleep、无预录结果）
-python demo.py
+# 固定输入演示（约 0.05 秒，远低于 90 秒；无 sleep、无预录结果）
+./.venv/bin/python demo.py
 ```
 
 库以包形式导入：`import vmshoot`（或 `from vmshoot import MMU, AccessType, ...`）。
@@ -57,7 +57,6 @@ mmu.destroy_address_space(asid)
 ```
 
 ### map / unmap / protect（先更新页表，再返回失效票据）
-
 ```python
 t1 = mmu.map(asid, 0x1000, PERM_RW)                  # 小页（256 对齐）
 t2 = mmu.map(asid, 0x4000, PERM_RWX, huge=True)     # 大页（4096 对齐）
@@ -71,6 +70,30 @@ t4 = mmu.protect(asid, 0x4300, PERM_READ)            # 大页中间地址 -> 自
   快捷路径：需要整体改时，对 16 个小页分别 protect。
 * `unmap` **不隐式拆分大页**：大页内部地址抛 `MappingConflict`；请在大页起始
   unmap，或先 `protect` 拆分再逐页 unmap。
+
+### remap_range（同 ASID 整段映射平移）
+
+```python
+t = mmu.remap_range(asid, src_vaddr, dst_vaddr, size)   # -> Ticket（kind="remap"）
+```
+
+把 `[src_vaddr, src_vaddr+size)` 的完整映射平移到 `[dst_vaddr, dst_vaddr+size)`，
+**物理帧与权限不变**——纯离线地址重定位，不复制物理数据、不调用任何 OS 内存接口。
+
+* 源与目标都必须小页（256）对齐，`size` 必须是小页的正整数倍，两区间都不得越出
+  16 位虚址空间，且**源与目标不得重叠**（`MappingConflict`）；
+* **源不能有洞**：源区间逐小页检查，缺页抛 `NotMapped`；
+* **目标不能碰现有映射**：目标区间逐小页检查，被占用抛 `MappingExists`；
+* **先整体检查再动页表**：上述任一检查失败时页表与帧池完全不变（也不产生票据）；
+  检查通过后的应用阶段只重挂既有 PTE、不分配/释放帧，不会中途失败；
+* 大页处理：源大页**只搬一部分**时先就地拆成 16 个小页（未搬部分以原帧原权限
+  留在源处）；源大页被整段覆盖**且目标映像 4096 对齐**时保持原大页整体搬走；
+  其余情况目标侧为小页，**不做重新合并**；
+* 失效票据**同时覆盖源与目标**：两区间的全部小页 key，加上两区间触及的每个
+  4096 区域的大页标记 key（部分覆盖时大页基 vpn 可能落在源区间之外，陈旧大页
+  项同样被失效）。ACK 前旧 TLB 项允许继续命中（与 map/unmap/protect 同一窗口）；
+  全部 ACK 并 `finish` 后，源地址访问必为 `not_mapped`，目标地址得到原物理地址；
+* remap 票据未 `finish` 期间，该 ASID 号同样不能被新地址空间复用（`AsidBusy`）。
 
 ### 失效票据协议（`Ticket`）
 
@@ -106,6 +129,8 @@ wr = mmu.walk_table(asid, vaddr)   # 绕过 TLB 的纯页表遍历：None 或 Wa
 
 * 虚拟地址：`0..0xffff`；`length`：`1..4096`；ASID：`0..3`；核号：`0..1`；
   权限位：非零、只含 r/w/x（`1..7`）；活动地址空间最多 4 个。
+* `remap_range` 的 `size`：小页（256）的正整数倍，且源/目标区间末端不越出
+  `0xffff`；源与目标不得重叠。
 * **整数参数拒绝 `bool`**（`True` 不是 1）与 `float`（含 `1.0`）；
   `NaN` / `±Infinity` 以 `ValueError` 拒绝；类型不符为 `TypeError`。
   所有错误消息带参数名（如 `vaddr`、`core_id`、`length`），不静默纠正。
@@ -144,12 +169,16 @@ VMShootError
    生命周期独立，槽位复用严格等待 finish。
 5. **不模拟字节内容**：物理内存只维护帧占用位图与地址翻译，不存放页内数据字节
    （本题契约只要求翻译、权限与失效）。
-6. **无浮点运算**：全部结果为整数地址/枚举，因此不存在浮点误差；本库没有需要
+6. **remap_range 是两阶段操作**：先只读预检（对齐/重叠/源无洞/目标全空），全部
+   通过后才动页表；应用阶段只重挂既有 PTE、不分配不释放帧，因此要么整体成功、
+   要么完全不变，不存在部分变更。大页“整段覆盖且目标 4096 对齐”才保持大页，
+   其余一律拆小且不再合并——换来的是实现与失效 key 的确定性。
+7. **无浮点运算**：全部结果为整数地址/枚举，因此不存在浮点误差；本库没有需要
    声明误差口径的数值输出。
 
 ## 测试
 
-`python -m unittest discover -s tests -v`，共 59 个：
+`./.venv/bin/python -m unittest discover -s tests -v`，共 74 个：
 
 * `test_primitives.py`：固定常量、地址拆分、NaN/Infinity/bool/float 拒绝；
 * `test_page_tables.py`：小页/大页映射、首位适配帧号（独立公式推导期望）、
@@ -157,7 +186,11 @@ VMShootError
 * `test_tlb_invalidation.py`：8 项 LRU 淘汰与刷新、ASID key 隔离、ACK 前后陈旧
   项、finish 阻塞、大页拆分的跨核失效、read/write/execute fault、跨页拒绝、
   ASID 复用被未完成票据阻塞；
-* `test_oracle.py`：**独立参考模型** `RefMMU`（自行实现页表/帧池/LRU/票据，
+* `test_remap.py`：remap_range 的帧/权限保持、双核缓存旧源、目标曾缓存别的映射、
+  跨大页边界拆分、整段对齐保持大页、目标未对齐拆小、目标冲突/源有洞/区间重叠/
+  非法参数失败后页表完全不变、未结束 remap 票据阻塞 ASID 复用；以**独立逐小页
+  映射表**（vpn -> 物理地址/权限的纯 dict 参考）全量核对 256 个小页；
+* `test_oracle.py`：**独立参考模型** `RefMMU`（自行实现页表/帧池/LRU/票据/remap，
   不调用被测核心算法取期望值），用 11 个固定种子（600 + 10×400 步）的随机
   操作序列双跑差分，逐步核对票据、翻译结果、无 TLB 遍历结果、TLB 内容与帧占用。
 
@@ -168,5 +201,7 @@ VMShootError
 * 无实际字节读写与访问位/脏位；物理地址是模拟值，不触碰真实内存。
 * 失效目标核固定为全部 2 核，不支持选择性核掩码；票据为同步 API 模拟，不涉及
   真实中断/IPI 时序与并发线程。
+* `remap_range` 只做离线地址重定位：不复制物理数据、不调用 OS 内存接口；
+  目标侧不满足整段 4096 对齐时一律拆成小页，且**不做大页重新合并**。
 * 默认帧池 1088 帧（4×256+64）；构造 `MMU(PhysicalMemory(num_frames=...))` 可改。
 * 不提供持久化、CLI、Web 界面（`demo.py` 仅为固定输入的最小演示）。

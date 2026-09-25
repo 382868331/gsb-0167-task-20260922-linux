@@ -22,6 +22,7 @@ from .errors import (
 )
 from .memory import PhysicalMemory
 from .primitives import (
+    HUGE_BITS,
     HUGE_PAGE_MASK,
     HUGE_PAGE_SIZE,
     L1_SIZE,
@@ -36,6 +37,7 @@ from .primitives import (
     PERM_WRITE,
     TLB_SIZE,
     VADDR_MAX,
+    VADDR_SPACE,
     perm_to_str,
     split_vaddr,
     validate_int,
@@ -69,7 +71,7 @@ class PTE:
 class Ticket:
     """失效票据。
 
-    * ``kind``：``map`` / ``unmap`` / ``protect``；
+    * ``kind``：``map`` / ``unmap`` / ``protect`` / ``remap``；
     * ``keys``：需要失效的 TLB key（小页粒度的 ``(asid, vpn)``）；
     * ``targets``：必须 ACK 的核（本实现中恒为全部核）；
     * ``acks``：已 ACK 的核集合；
@@ -262,6 +264,78 @@ class AddressSpace:
         table[l2i].perms = perms
         self.l1[l1i] = table
         return table, l2i
+
+    # ---- remap_range ----------------------------------------------------------
+    def check_remap_range(self, src: int, dst: int, size: int) -> None:
+        """remap_range 的只读预检：源区间无洞、目标区间全空。
+
+        本方法不修改任何状态；所有失败都在动页表之前抛出。
+        """
+        for off in range(0, size, PAGE_SIZE):
+            if self.walk(src + off) is None:
+                raise NotMapped(f"源区间存在空洞：vaddr=0x{src + off:x} 没有映射")
+        for off in range(0, size, PAGE_SIZE):
+            if self.walk(dst + off) is not None:
+                raise MappingExists(f"目标区间已被占用：vaddr=0x{dst + off:x} 已存在映射")
+
+    def remap_range(self, src: int, dst: int, size: int) -> None:
+        """把 ``[src, src+size)`` 的完整映射平移到 ``[dst, dst+size)``。
+
+        调用方已保证：两端小页对齐、区间不重叠、源无洞、目标全空
+        （见 :meth:`check_remap_range` 与 :meth:`MMU.remap_range`）。
+        本方法只重挂既有 PTE，不分配也不释放帧，因此应用阶段不会失败，
+        不存在部分变更。大页处理：
+
+        * 源大页被整段覆盖、且其目标映像 4096 对齐 -> 一级叶子整体搬走（保持大页）；
+        * 其余情况（只搬一部分、或目标映像未 4096 对齐）-> 先就地拆成 16 个小页
+          再逐页搬；未搬走的部分以原帧原权限留在源处。不做重新合并。
+        """
+        end = src + size
+        kept_huge: list[tuple[int, int]] = []  # (源大页基址, 目标大页基址)
+        # 1) 逐个相交大页决定去向；需要拆的就地拆（纯指针安装，帧与权限不变）
+        h = src & ~HUGE_PAGE_MASK
+        while h < end:
+            l1i = h >> HUGE_BITS
+            e = self.l1[l1i]
+            if isinstance(e, PTE):
+                dst_h = dst + (h - src)
+                if h >= src and h + HUGE_PAGE_SIZE <= end and dst_h % HUGE_PAGE_SIZE == 0:
+                    kept_huge.append((h, dst_h))
+                else:
+                    self.l1[l1i] = [
+                        PTE(ppn=e.ppn + j, perms=e.perms, huge=False)
+                        for j in range(L2_SIZE)
+                    ]
+            h += HUGE_PAGE_SIZE
+        # 2) 整体搬走的大页
+        moved_huge: set[int] = set()
+        for h_src, h_dst in kept_huge:
+            src_l1i = h_src >> HUGE_BITS
+            dst_l1i = h_dst >> HUGE_BITS
+            pte = self.l1[src_l1i]
+            self.l1[dst_l1i] = pte  # 目标槽为 None 或全空二级表（预检保证无映射）
+            self.l1[src_l1i] = None
+            moved_huge.add(h_src)
+        # 3) 逐小页搬走其余页
+        for off in range(0, size, PAGE_SIZE):
+            s = src + off
+            if (s & ~HUGE_PAGE_MASK) in moved_huge:
+                continue
+            d = dst + off
+            sl1, sl2, _ = split_vaddr(s)
+            dl1, dl2, _ = split_vaddr(d)
+            table = self.l1[sl1]
+            if not isinstance(table, list) or table[sl2] is None:
+                raise AssertionError("内部错误：remap 源页在预检后丢失映射")
+            pte = table[sl2]
+            table[sl2] = None
+            dtable = self.l1[dl1]
+            if dtable is None:
+                dtable = [None] * L2_SIZE
+                self.l1[dl1] = dtable
+            dtable[dl2] = pte  # 预检保证该槽为空
+            if all(x is None for x in table):
+                self.l1[sl1] = None  # 回收空的二级表（与 unmap 一致）
 
     # ---- 销毁 ---------------------------------------------------------------
     def destroy(self) -> None:
@@ -463,6 +537,67 @@ class MMU:
             )
         sp.protect_small(va, p)
         return self._issue(sp.asid, "protect", va, self._keys_for(sp.asid, va, False))
+
+    def remap_range(self, asid, src_vaddr, dst_vaddr, size) -> Ticket:
+        """把同一 ASID 内 ``[src_vaddr, src_vaddr+size)`` 的完整映射平移到
+        ``[dst_vaddr, dst_vaddr+size)``，物理帧与权限不变（纯地址重定位，
+        不复制任何物理数据）。
+
+        契约：
+
+        * ``src_vaddr`` / ``dst_vaddr`` 必须小页（256）对齐，``size`` 必须为
+          小页的正整数倍，且两个区间都落在 16 位虚址空间内；
+        * 源与目标区间不得重叠（:class:`MappingConflict`）；
+        * 源区间不能有洞（逐小页检查，缺页抛 :class:`NotMapped`）；
+        * 目标区间不能碰到任何现有映射（逐小页检查，抛 :class:`MappingExists`）；
+        * **先整体检查再动页表**：以上任一检查失败时页表与帧池完全不变；
+          检查通过后的应用阶段不分配/释放帧，不会中途失败。
+        * 源大页只搬一部分时先就地拆成小页；源大页被整段覆盖且目标映像
+          4096 对齐时保持原大页整体搬走；其余情况目标侧为小页，不重新合并。
+
+        失效票据同时覆盖源与目标两个区间的全部小页 key，以及两区间触及的
+        每个 4096 区域的大页标记 key（含部分覆盖时位于源区间之外的大页基
+        vpn）。ACK 之前旧 TLB 项允许继续命中（陈旧翻译窗口与 map/unmap/
+        protect 一致）；全部 ACK 并 finish 后，源地址访问必为 not_mapped，
+        目标地址得到原物理地址。票据未 finish 期间该 ASID 号同样不能复用。
+        """
+        sp = self._space(asid)
+        src = validate_vaddr(src_vaddr, "src_vaddr")
+        dst = validate_vaddr(dst_vaddr, "dst_vaddr")
+        n = validate_int(size, "size")
+        if n == 0 or n % PAGE_SIZE:
+            raise ValueError(f"size 必须为小页（{PAGE_SIZE}）的正整数倍，得到 {n}")
+        if src % PAGE_SIZE:
+            raise ValueError(f"src_vaddr 要求 {PAGE_SIZE} 对齐，得到 0x{src:x}")
+        if dst % PAGE_SIZE:
+            raise ValueError(f"dst_vaddr 要求 {PAGE_SIZE} 对齐，得到 0x{dst:x}")
+        if src + n > VADDR_SPACE:
+            raise ValueError(f"源区间末端 0x{src + n - 1:x} 超出虚拟地址空间")
+        if dst + n > VADDR_SPACE:
+            raise ValueError(f"目标区间末端 0x{dst + n - 1:x} 超出虚拟地址空间")
+        if src < dst + n and dst < src + n:
+            raise MappingConflict(
+                f"源区间 [0x{src:x}, 0x{src + n:x}) 与目标区间 "
+                f"[0x{dst:x}, 0x{dst + n:x}) 重叠"
+            )
+        sp.check_remap_range(src, dst, n)   # 只读预检：失败时页表完全不变
+        sp.remap_range(src, dst, n)         # 无资源分配，应用阶段不会失败
+        return self._issue(sp.asid, "remap", src,
+                           self._keys_for_remap(sp.asid, src, dst, n))
+
+    @staticmethod
+    def _keys_for_remap(asid: int, src: int, dst: int, size: int) -> tuple[tuple[int, int], ...]:
+        """remap 票据的失效 key：源+目标全部小页 vpn，以及两区间触及的每个
+        4096 区域的大页标记 vpn（部分覆盖时大页基 vpn 可能落在区间之外，
+        陈旧大页项同样必须被失效）。按 vpn 升序，确定性输出。"""
+        vpns: set[int] = set()
+        for base in (src, dst):
+            vpns.update(range(base >> PAGE_BITS, (base + size) >> PAGE_BITS))
+            h = base & ~HUGE_PAGE_MASK
+            while h < base + size:
+                vpns.add(h >> PAGE_BITS)
+                h += HUGE_PAGE_SIZE
+        return tuple((asid, v) for v in sorted(vpns))
 
     # ---- TLB ----------------------------------------------------------------
     def tlb_keys(self, core_id) -> list[tuple[int, int]]:

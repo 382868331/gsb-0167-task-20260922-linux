@@ -9,7 +9,7 @@
 * 最多 4 个活动地址空间（ASID 0..3）。物理内存只是 Python 内的位图模拟，
   不调用任何 OS 映射（无 mmap）。
 
-失效协议（map/unmap/protect）：
+失效协议（map/unmap/protect/remap_range）：
 
 1. 先更新页表；
 2. 产生一张 :class:`Ticket`，列出需要失效的 TLB key 与全部目标核；
@@ -18,6 +18,11 @@
 5. :meth:`MMU.finish` 必须等待所有目标核 ACK，否则抛
    :class:`InvalidationsPending`。
 6. 被销毁/重建的 ASID 号在仍有未 finish 票据时不能复用（:class:`AsidBusy`）。
+
+:meth:`MMU.remap_range` 把同一 ASID 内一段无洞的完整映射平移到不重叠的
+空闲目标区：物理帧与权限不变（纯地址重定位，不复制数据），先整体检查再动
+页表；源大页只搬一部分时拆成小页，整段对齐时保持大页；失效票据同时覆盖
+源与目标，finish 后源地址必 fault、目标得到原物理地址。
 
 翻译：:meth:`MMU.translate` 返回 :class:`TranslationResult`，成功给物理地址，
 失败给 ``not_mapped/read/write/execute`` fault；一次访问跨越所在页边界抛

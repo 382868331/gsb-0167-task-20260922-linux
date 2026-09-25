@@ -8,6 +8,8 @@
    全部 ACK + finish 后翻译变为 not_mapped；
 3. 大页中间改权限：ACK 前陈旧写仍成功，ACK 后目标页 write fault、邻页保持 rwx；
 4. 真实触发的边界：跨页访问抛 CrossPageAccess；未完成票据阻塞 ASID 复用 (AsidBusy)。
+5. remap_range：整段映射平移，ACK 前双核旧源仍可命中，finish 后源 fault、
+   目标得到原物理地址；目标被占用时真实触发 MappingExists 且页表不变。
 """
 
 from __future__ import annotations
@@ -19,8 +21,10 @@ from vmshoot import (
     CrossPageAccess,
     InvalidAddressSpace,
     InvalidationsPending,
+    MappingExists,
     PERM_RW,
     PERM_RWX,
+    PERM_RX,
     PERM_READ,
     perm_to_str,
 )
@@ -151,6 +155,46 @@ def main() -> None:
         mmu.translate(a3, 0, 0x0000, AccessType.READ)
     except InvalidAddressSpace as e:
         print(f"  销毁后翻译被拒绝：{type(e).__name__}: {e}")
+
+    # ---- 5. remap_range：整段映射平移 --------------------------------------
+    hr("5. remap_range：0x6000 起 3 个小页平移到 0xa000（帧与权限不变）")
+    mmu2 = MMU()
+    a = mmu2.create_address_space()
+    t_a = mmu2.map(a, 0x6000, PERM_RW)
+    t_b = mmu2.map(a, 0x6100, PERM_RX)
+    t_c = mmu2.map(a, 0x6200, PERM_READ)
+    settle(mmu2, t_a, t_b, t_c)
+    # 双核缓存旧源页
+    mmu2.translate(a, 0, 0x6000, AccessType.READ)
+    mmu2.translate(a, 1, 0x6100, AccessType.READ)
+    before = [mmu2.walk_table(a, 0x6000 + j * 0x100).phys_addr for j in range(3)]
+    print(f"  源三页物理地址（页基）: {[hex(p) for p in before]}")
+    tr = mmu2.remap_range(a, 0x6000, 0xA000, 3 * 0x100)
+    print(f"  页表已平移；票据 #{tr.id} 覆盖 {len(tr.keys)} 个 key（源+目标）")
+    show("[失效前] 核0 读 0x6000（旧 TLB 项允许存在）",
+         mmu2.translate(a, 0, 0x6000, AccessType.READ))
+    show("[失效前] 核1 读 0x6100（旧 TLB 项允许存在）",
+         mmu2.translate(a, 1, 0x6100, AccessType.READ))
+    settle(mmu2, tr)
+    show("[失效后] 核0 读 0x6000（源必须 fault）",
+         mmu2.translate(a, 0, 0x6000, AccessType.READ))
+    for j in range(3):
+        show(f"[失效后] 核1 读 0x{0xA000 + j * 0x100:04x}（目标得到原物理地址）",
+             mmu2.translate(a, 1, 0xA000 + j * 0x100, AccessType.READ))
+    after = [mmu2.walk_table(a, 0xA000 + j * 0x100).phys_addr for j in range(3)]
+    print(f"  目标三页物理地址（页基）: {[hex(p) for p in after]}  "
+          f"-> 与源完全一致: {before == after}")
+
+    # ---- 5b. 真实触发的拒绝：目标被占用，页表完全不变 ----------------------
+    t_occ = mmu2.map(a, 0xC000, PERM_RW)
+    settle(mmu2, t_occ)
+    n_maps = len(mmu2.mappings(a))
+    try:
+        mmu2.remap_range(a, 0xA000, 0xC000, 0x100)  # 0xc000 已被占用
+    except MappingExists as e:
+        print(f"  目标冲突被拒绝：{type(e).__name__}: {e}")
+    print(f"  失败后页表完全不变：映射数 {n_maps} == {len(mmu2.mappings(a))}，"
+          f"帧占用 {mmu2.mem.used_frames()} 帧")
 
     print("\n演示完成：以上物理地址、fault 与异常均为库实时计算结果。")
 
