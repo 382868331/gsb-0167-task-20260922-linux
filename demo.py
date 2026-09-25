@@ -7,7 +7,10 @@
 2. unmap 的失效票据：ACK 前双核陈旧 TLB 项仍可见、finish 被阻塞，
    全部 ACK + finish 后翻译变为 not_mapped；
 3. 大页中间改权限：ACK 前陈旧写仍成功，ACK 后目标页 write fault、邻页保持 rwx；
-4. 真实触发的边界：跨页访问抛 CrossPageAccess；未完成票据阻塞 ASID 复用 (AsidBusy)。
+4. remap_range：整段映射平移——物理页/权限不变、双核旧源陈旧项、finish 后
+   源 fault 且目标得到原物理地址、大页整段对齐平移保持大页、目标冲突被拒绝
+   且页表完全不变；
+5. 真实触发的边界：跨页访问抛 CrossPageAccess；未完成票据阻塞 ASID 复用 (AsidBusy)。
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from vmshoot import (
     CrossPageAccess,
     InvalidAddressSpace,
     InvalidationsPending,
+    MappingExists,
     PERM_RW,
     PERM_RWX,
     PERM_READ,
@@ -111,8 +115,52 @@ def main() -> None:
           f"0x4300 -> ppn={w_tgt.ppn} perms={perm_to_str(w_tgt.perms)} huge={w_tgt.huge}；"
           f"0x4f00 -> perms={perm_to_str(w_other.perms)}")
 
-    # ---- 4a. 真实触发的拒绝：跨页访问 -------------------------------------
-    hr("4. 真实触发的拒绝/异常边界")
+    # ---- 4. remap_range：整段映射平移 ---------------------------------------
+    hr("4. remap_range：把 0x6000..0x61ff 两页搬到 0xC000（物理页/权限不变）")
+    ta = mmu.map(asid, 0x6000, PERM_RW)
+    tb = mmu.map(asid, 0x6100, PERM_READ)
+    settle(mmu, ta, tb)
+    phys_a = mmu.translate(asid, 0, 0x6000, AccessType.READ).phys_addr
+    phys_b = mmu.translate(asid, 1, 0x6100, AccessType.READ).phys_addr
+    print(f"  搬迁前：0x6000(rw-) -> phys=0x{phys_a:04x}；0x6100(r--) -> phys=0x{phys_b:04x}"
+          f"（双核已缓存旧源）")
+    tr = mmu.remap_range(asid, 0x6000, 0xC000, 0x200)
+    print(f"  票据 #{tr.id} kind={tr.kind} 覆盖 {len(tr.keys)} 个失效 key（源∪目标）")
+    show("[ACK 前] 核0 读 0x6000（旧 TLB 项允许存在）",
+         mmu.translate(asid, 0, 0x6000, AccessType.READ))
+    show("[ACK 前] 核1 读 0x6100（旧 TLB 项允许存在）",
+         mmu.translate(asid, 1, 0x6100, AccessType.READ))
+    settle(mmu, tr)
+    show("[finish 后] 核0 读 0x6000（源必须 fault）",
+         mmu.translate(asid, 0, 0x6000, AccessType.READ))
+    show("[finish 后] 核0 读 0xC000（目标得到原物理地址）",
+         mmu.translate(asid, 0, 0xC000, AccessType.READ))
+    show("[finish 后] 核1 读 0xC100（权限随页搬运，r--）",
+         mmu.translate(asid, 1, 0xC100, AccessType.READ))
+    show("[finish 后] 核1 写 0xC100（r-- 写仍 fault）",
+         mmu.translate(asid, 1, 0xC100, AccessType.WRITE))
+
+    # 大页整段对齐平移：保持大页
+    th = mmu.map(asid, 0x8000, PERM_RWX, huge=True)
+    settle(mmu, th)
+    w0 = mmu.walk_table(asid, 0x8000)
+    th2 = mmu.remap_range(asid, 0x8000, 0xA000, 0x1000)
+    settle(mmu, th2)
+    w1 = mmu.walk_table(asid, 0xA000)
+    print(f"  大页整段平移 0x8000 -> 0xA000：保持大页 huge={w1.huge}，"
+          f"ppn 不变 {w1.ppn == w0.ppn}，源 0x8000 已无映射 "
+          f"{mmu.walk_table(asid, 0x8000) is None}")
+
+    # 目标冲突：拒绝且页表完全不变
+    before = mmu.mappings(asid)
+    try:
+        mmu.remap_range(asid, 0xC000, 0xA000, 0x100)  # 0xA000 已被大页占据
+    except MappingExists as e:
+        print(f"  目标冲突被拒绝：{type(e).__name__}: {e}")
+    print(f"  失败后页表完全不变：{mmu.mappings(asid) == before}")
+
+    # ---- 5a. 真实触发的拒绝：跨页访问 -------------------------------------
+    hr("5. 真实触发的拒绝/异常边界")
     t_ro = mmu.map(asid, 0x2000, PERM_READ)
     settle(mmu, t_ro)
     try:

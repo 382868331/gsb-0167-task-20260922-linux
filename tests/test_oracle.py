@@ -116,7 +116,6 @@ class RefMMU:
         self.tickets[tid] = {"asid": asid, "kind": kind, "va": va,
                              "keys": tuple(keys), "acks": set()}
         return tid
-
     @staticmethod
     def keys_for(asid, va, huge):
         if huge:
@@ -186,6 +185,73 @@ class RefMMU:
             raise NotMapped("ref")
         e[l2i] = (e[l2i][0], perms)
         return self.issue(asid, "protect", va, self.keys_for(asid, va, False))
+
+    def remap_range(self, asid, src, dst, length) -> int:
+        """独立重写的 remap：先整体检查，再纯指针搬迁（不动帧位图）。"""
+        if length <= 0 or length & 0xFF or src & 0xFF or dst & 0xFF:
+            raise ValueError("ref align")
+        if src + length > 0x10000 or dst + length > 0x10000:
+            raise ValueError("ref range")
+        n = length >> 8
+        l1 = self.spaces[asid]
+        # 源不能有洞
+        for i in range(n):
+            if self.walk(asid, src + (i << 8)) is None:
+                raise NotMapped("ref hole")
+        # 目标不能碰现有映射
+        for i in range(n):
+            if self.walk(asid, dst + (i << 8)) is not None:
+                raise MappingExists("ref conflict")
+        j = 0
+        while j < n:
+            sva = src + (j << 8)
+            sl1, sl2 = (sva >> 12) & 0xF, (sva >> 8) & 0xF
+            cnt = 1
+            while j + cnt < n and (((src + ((j + cnt) << 8)) >> 12) & 0xF) == sl1:
+                cnt += 1
+            dva = dst + (j << 8)
+            dl1 = (dva >> 12) & 0xF
+            e = l1[sl1]
+            if isinstance(e, tuple):
+                _, base, perms = e
+                if cnt == 16 and (dva & 0xFFF) == 0:
+                    l1[sl1] = None
+                    l1[dl1] = ("H", base, perms)
+                else:
+                    table = [(base + q, perms) for q in range(16)]
+                    moves = []
+                    for q in range(cnt):
+                        table[sl2 + q] = None
+                        tva = dst + ((j + q) << 8)
+                        moves.append(((tva >> 12) & 0xF, (tva >> 8) & 0xF,
+                                      (base + sl2 + q, perms)))
+                    l1[sl1] = table
+                    for tl1i, tl2i, pte in moves:
+                        if l1[tl1i] is None:
+                            l1[tl1i] = [None] * 16
+                        l1[tl1i][tl2i] = pte
+            else:
+                for q in range(cnt):
+                    pte = e[sl2 + q]
+                    e[sl2 + q] = None
+                    tva = dst + ((j + q) << 8)
+                    tl1i, tl2i = (tva >> 12) & 0xF, (tva >> 8) & 0xF
+                    if l1[tl1i] is None:
+                        l1[tl1i] = [None] * 16
+                    l1[tl1i][tl2i] = pte
+            j += cnt
+        for idx, e in enumerate(l1):
+            if isinstance(e, list) and all(x is None for x in e):
+                l1[idx] = None
+        # 失效 keys：源、目标涉及的每个 4096 块列全部 16 个小页 key
+        blocks = set()
+        for base in (src, dst):
+            blocks.update(range(base >> 12, ((base + length - 1) >> 12) + 1))
+        vpns = set()
+        for sl1 in blocks:
+            vpns.update(sl1 * 16 + q for q in range(16))
+        keys = tuple((asid, v) for v in sorted(vpns))
+        return self.issue(asid, "remap", src, keys)
 
     # ---- 票据 -----------------------------------------------------------
     def ack(self, core, tid) -> None:
@@ -323,9 +389,11 @@ class TestDifferential(unittest.TestCase):
         st = fn(sut)
         rt = ref.tickets[rid]
         self.assertEqual(st.id, rid)
+        self.assertEqual(st.kind, rt["kind"])
         self.assertEqual(st.keys, rt["keys"])
         self.assertEqual(st.targets, (0, 1))
         self.assertEqual(st.asid, rt["asid"])
+        self.assertEqual(st.vaddr, rt["va"])
 
     def _cmp_translate(self, sut, ref, asid, core, va, acc, length):
         try:
@@ -379,7 +447,16 @@ class TestDifferential(unittest.TestCase):
                     perms = rng.choice(PERMS_CHOICES)
                     self._cmp_ticket(
                         lambda m, a=a, va=va, p=perms: m.protect(a, va, p), sut, ref)
-                elif r < 0.88 and active:
+                elif r < 0.74 and active:
+                    a = rng.choice(active)
+                    n = rng.randrange(1, 21)
+                    s_va = rng.randrange(256 - n + 1) * 256
+                    d_va = rng.randrange(256 - n + 1) * 256
+                    ln = n * 256
+                    self._cmp_ticket(
+                        lambda m, a=a, s=s_va, d=d_va, ln=ln:
+                            m.remap_range(a, s, d, ln), sut, ref)
+                elif r < 0.94 and active:
                     a = rng.choice(active)
                     core = rng.randrange(2)
                     va = rng.randrange(0x10000)
