@@ -5,22 +5,38 @@
 目标核”的 TLB 失效协议。不调用任何 OS 内存映射（无 `mmap`）、无第三方依赖、
 无网络/账号/密钥/数据库/中间件。
 
+本次迭代新增：页表项 **A（Accessed）/ D（Dirty）位**、TLB 命中路径的标志记录，
+以及“采样并清位”接口 `sample_and_clear`（先合并各核 TLB 挂起标志、再清位并
+推进采样世代，迟到的旧世代回写不会污染新一轮）。
+
 ## 运行环境
 
 * **Python 版本：3.14.7**（仅使用 3.10+ 通用语法，3.14.7 实测）
 * **依赖：无**（只用 Python 标准库，`requirements.txt` 为空说明性文件）
 * **平台：Linux 原生运行**，无需 Docker、无需编译
 
+### venv 准备（可选）
+
+不装任何第三方包也能直接跑；若想用隔离环境：
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate        # 之后直接用 python 即可
+```
+
 ## 准确命令
 
 在仓库根目录（本文件所在目录）执行：
 
 ```bash
-# 全部必要测试（57 个）
+# 全部必要测试（72 个）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（约 0.04 秒，远低于 8 秒；无 sleep、无预录结果）
+# 固定输入演示（毫秒级；无 sleep、无预录结果）
 python demo.py
+
+# 本次迭代演示：A/D 位、采样世代与两个边界情况（远低于 90 秒）
+python demo_iteration.py
 ```
 
 库以包形式导入：`import vmshoot`（或 `from vmshoot import MMU, AccessType, ...`）。
@@ -102,6 +118,36 @@ wr = mmu.walk_table(asid, vaddr)   # 绕过 TLB 的纯页表遍历：None 或 Wa
 诊断：`mmu.tlb_keys(core_id)`（LRU 顺序的 key 列表）、`mmu.tlb_len(core_id)`、
 `mmu.mappings(asid)`（`(起始虚址, 字节数, 权限, 是否大页)` 升序枚举）。
 
+### A/D 位与采样（本次迭代新增）
+
+每个 PTE 增加 `accessed` / `dirty` 两个布尔位：
+
+* **成功访问才置 A**（读/写/执行任意一种成功即置）；**成功写入再置 D**；
+* **TLB 命中同样记录**：命中时标志先挂在该核 TLB 项上（`pend_a`/`pend_d`），
+  在采样、TLB 项被 LRU 逐出、或 ACK 失效移除该项时合并回页表——
+  不是只有 page walk 才更新；walk 路径则像硬件遍历一样直接置 PTE 位；
+* **权限失败与未映射的访问不留下任何成功访问痕迹**（fault 路径不置位）。
+
+```python
+res = mmu.sample_and_clear(asid)   # -> SampleResult
+res.generation                     # 被封存的世代编号
+res.pages[0x1000].accessed         # PageFlags: vaddr/accessed/dirty/huge
+res.flagged()                      # 只保留 A 或 D 置位的页
+mmu.generation(asid)               # 当前世代编号
+```
+
+`sample_and_clear` 的顺序（整个调用即**线性化点**，本模型为顺序执行）：
+
+1. 两个核把该 ASID 在 TLB 中挂起的 A/D 标志合并回页表；
+2. 快照全部映射页的 A/D 位（即返回的采样结果）；
+3. 清除页表中的 A/D 位；
+4. 世代编号加一，并给现存 TLB 项盖上新世代戳。
+
+由此保证：调用之前的成功访问必然出现在本次采样中；调用之后的新访问只属于下一
+世代，不会被本次清位抹掉；采样前遗留、采样后才被逐出/失效的 TLB 项因世代戳
+过期，其**迟到的旧世代回写被直接丢弃**，不会污染新一轮。大页的 A/D 位在一级
+叶子上，按整个 4096 字节大页记录。
+
 ### 输入上限与错误语义
 
 * 虚拟地址：`0..0xffff`；`length`：`1..4096`；ASID：`0..3`；核号：`0..1`；
@@ -114,6 +160,9 @@ wr = mmu.walk_table(asid, vaddr)   # 绕过 TLB 的纯页表遍历：None 或 Wa
   是纯指针安装、不分配资源故不可能中途失败。
 * 帧分配做确定性全扫描首位适配，找不到即 `FrameExhausted`——这是当前占用状态下的
   **证明无解**；本模块没有搜索预算类算法，因此不存在“预算耗尽”这一状态。
+* `sample_and_clear` / `generation` 的 `asid` 校验与 `translate` 相同：
+  未创建/已销毁的 ASID 抛 `InvalidAddressSpace`；类型违规同上（`bool`/`float`
+  拒绝）。采样本身不分配资源，不存在部分变更。
 
 ### 异常层次
 
@@ -144,12 +193,16 @@ VMShootError
    生命周期独立，槽位复用严格等待 finish。
 5. **不模拟字节内容**：物理内存只维护帧占用位图与地址翻译，不存放页内数据字节
    （本题契约只要求翻译、权限与失效）。
-6. **无浮点运算**：全部结果为整数地址/枚举，因此不存在浮点误差；本库没有需要
+6. **A/D 位走“TLB 挂起 + 世代戳”模型**：真实硬件在遍历时直接写 PTE，本模型
+   为复现“采样须先让各核合并 TLB”的语义，让 TLB 命中的标志暂存在 TLB 项上，
+   用每 ASID 的世代编号区分新旧；回写目标按当前页表解析（标志跟随虚拟页），
+   映射已消失时标志随映射消亡。
+7. **无浮点运算**：全部结果为整数地址/枚举，因此不存在浮点误差；本库没有需要
    声明误差口径的数值输出。
 
 ## 测试
 
-`python -m unittest discover -s tests -v`，共 59 个：
+`python -m unittest discover -s tests -v`，共 72 个：
 
 * `test_primitives.py`：固定常量、地址拆分、NaN/Infinity/bool/float 拒绝；
 * `test_page_tables.py`：小页/大页映射、首位适配帧号（独立公式推导期望）、
@@ -160,12 +213,18 @@ VMShootError
 * `test_oracle.py`：**独立参考模型** `RefMMU`（自行实现页表/帧池/LRU/票据，
   不调用被测核心算法取期望值），用 11 个固定种子（600 + 10×400 步）的随机
   操作序列双跑差分，逐步核对票据、翻译结果、无 TLB 遍历结果、TLB 内容与帧占用。
+* `test_accessed_dirty.py`：A/D 位与采样——walk/纯 TLB 命中两条路径置位、
+  fault 不留痕迹、两核同页合并、采样与写交错的世代隔离、TLB 逐出的迟到回写
+  不污染新一轮、ACK 失效先回写、大页标志；另有**独立账本对照**：固定种子随机
+  序列中按“成功访存事件 + 采样边界”独立记账，逐边界与 `sample_and_clear`
+  结果比对（账本只依据公开结果，不调用被测核心取期望值）。
 
 ## 已知限制 / 非目标
 
 * 只实现题面规定的 16 位虚址、两级 16 项页表等固定子集，**不兼容**任何真实
   指令集/行业标准页表格式，也不模拟页表基址寄存器、硬件遍历器、缓存一致性协议。
-* 无实际字节读写与访问位/脏位；物理地址是模拟值，不触碰真实内存。
+* 无实际字节读写；A/D 位为模拟标志而非真实页表硬件位，物理地址是模拟值，
+  不触碰真实内存。
 * 失效目标核固定为全部 2 核，不支持选择性核掩码；票据为同步 API 模拟，不涉及
   真实中断/IPI 时序与并发线程。
 * 默认帧池 1088 帧（4×256+64）；构造 `MMU(PhysicalMemory(num_frames=...))` 可改。

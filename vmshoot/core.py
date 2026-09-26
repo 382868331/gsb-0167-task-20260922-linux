@@ -63,6 +63,40 @@ class PTE:
     ppn: int
     perms: int
     huge: bool = False
+    accessed: bool = False
+    dirty: bool = False
+
+
+class TLBEntry(tuple):
+    """TLB 项：``(ppn, perms, huge)`` 元组 + 挂起的 A/D 标志与采样世代戳。
+
+    继承 :class:`tuple` 是为了保持与既有诊断/对账代码的相等语义
+    （只比较 ``(ppn, perms, huge)`` 三位）。附加属性：
+
+    * ``pend_a`` / ``pend_d``：TLB 命中期间累积、尚未合并回页表的 A/D 位；
+    * ``gen``：这些挂起标志所属的采样世代。世代在
+      :meth:`MMU.sample_and_clear`` 时推进；世代不匹配的迟到回写直接丢弃，
+      不会污染新一轮采样。
+    """
+
+    def __new__(cls, ppn: int, perms: int, huge: bool, gen: int = 0):
+        self = super().__new__(cls, (ppn, perms, huge))
+        self.pend_a = False
+        self.pend_d = False
+        self.gen = gen
+        return self
+
+    @property
+    def ppn(self) -> int:
+        return self[0]
+
+    @property
+    def perms(self) -> int:
+        return self[1]
+
+    @property
+    def huge(self) -> bool:
+        return self[2]
 
 
 @dataclass
@@ -140,6 +174,34 @@ class WalkResult:
         return self.ppn * PAGE_SIZE + (self.vaddr & off_mask)
 
 
+@dataclass
+class PageFlags:
+    """采样时单个映射页的 A/D 快照。"""
+
+    vaddr: int
+    accessed: bool
+    dirty: bool
+    huge: bool
+
+
+@dataclass
+class SampleResult:
+    """:meth:`MMU.sample_and_clear`` 的返回。
+
+    * ``generation``：本次采样封存的世代编号（清位前的世代）；
+    * ``pages``：``{页起始 vaddr: PageFlags}``，覆盖采样时刻该地址空间的
+      全部映射页（含未置位的页，便于账本对照）。
+    """
+
+    asid: int
+    generation: int
+    pages: dict[int, PageFlags]
+
+    def flagged(self) -> dict[int, PageFlags]:
+        """只保留 A 或 D 被置位的页。"""
+        return {v: f for v, f in self.pages.items() if f.accessed or f.dirty}
+
+
 # ===========================================================================
 # 地址空间（页表结构操作；不含 TLB / 票据逻辑）
 # ===========================================================================
@@ -163,6 +225,16 @@ class AddressSpace:
         if pte is None:
             return None
         return WalkResult(pte.ppn, pte.perms, False, vaddr)
+
+    def find_pte(self, vaddr: int) -> PTE | None:
+        """返回覆盖 ``vaddr`` 的 PTE 对象本身（供 A/D 标志合并），无映射给 None。"""
+        l1i, l2i, _ = split_vaddr(vaddr)
+        e = self.l1[l1i]
+        if e is None:
+            return None
+        if isinstance(e, PTE):
+            return e
+        return e[l2i]
 
     # ---- map ----------------------------------------------------------------
     def map_small(self, vaddr: int, perms: int) -> tuple[PTE, int]:
@@ -300,10 +372,12 @@ class MMU:
             raise TypeError("mem 必须是 PhysicalMemory 或 None")
         self.mem = mem if mem is not None else PhysicalMemory()
         self._spaces: dict[int, AddressSpace] = {}
-        # 每核一个 OrderedDict：key=(asid, vpn) -> (ppn, perms, huge)，头部为 LRU
+        # 每核一个 OrderedDict：key=(asid, vpn) -> TLBEntry，头部为 LRU
         self._tlb: list[OrderedDict] = [OrderedDict() for _ in range(NUM_CORES)]
         self._tickets: dict[int, Ticket] = {}
         self._next_ticket = 1
+        # 每个 ASID 的采样世代；sample_and_clear 推进
+        self._gen: dict[int, int] = {}
 
     # ---- 基础校验 -----------------------------------------------------------
     @staticmethod
@@ -344,6 +418,7 @@ class MMU:
                 continue
             sp = AddressSpace(cand, self.mem)
             self._spaces[cand] = sp
+            self._gen[cand] = 0
             return cand
         raise AsidBusy(busy[0], self._pending_for_asid(busy[0]))
 
@@ -364,6 +439,7 @@ class MMU:
                 del tlb[k]
         sp.destroy()
         del self._spaces[sp.asid]
+        del self._gen[sp.asid]
 
     # ---- 票据 ---------------------------------------------------------------
     def _issue(self, asid: int, kind: str, vaddr: int, keys: tuple) -> Ticket:
@@ -401,7 +477,9 @@ class MMU:
             raise TicketError(f"核 {c} 已 ACK 过票据 {tid}，不能重复 ACK")
         tlb = self._tlb[c]
         for k in t.keys:
-            tlb.pop(k, None)
+            victim = tlb.pop(k, None)
+            if victim is not None:
+                self._writeback_entry(k[0], k[1], victim)
         t.acks.add(c)
         return t
 
@@ -488,6 +566,76 @@ class MMU:
                 return entry, huge_k
         return None, None
 
+    # ---- A/D 标志：合并与采样 ----------------------------------------------
+    def _writeback_entry(self, asid: int, vpn: int, entry: TLBEntry) -> None:
+        """把一条 TLB 项的挂起 A/D 标志合并回页表。
+
+        世代不匹配的项是“迟到的旧世代回写”：其标志已在采样时结算过，
+        这里直接丢弃，绝不写入新一世代的 PTE。映射已消失时标志随映射消亡。
+        """
+        if not (entry.pend_a or entry.pend_d):
+            return
+        if entry.gen != self._gen.get(asid):
+            entry.pend_a = entry.pend_d = False
+            return
+        sp = self._spaces.get(asid)
+        pte = sp.find_pte(vpn << PAGE_BITS) if sp is not None else None
+        if pte is not None:
+            if entry.pend_a:
+                pte.accessed = True
+            if entry.pend_d:
+                pte.dirty = True
+        entry.pend_a = entry.pend_d = False
+
+    def generation(self, asid) -> int:
+        """当前采样世代编号（每次 :meth:`sample_and_clear` 后加一）。"""
+        sp = self._space(asid)
+        return self._gen[sp.asid]
+
+    def sample_and_clear(self, asid) -> SampleResult:
+        """采样并清除该地址空间全部映射页的 A/D 位，推进采样世代。
+
+        顺序（整体即**线性化点**，本模型为顺序执行，无并发窗口）：
+
+        1. 两个核各自把该 ASID 在 TLB 中挂起的 A/D 标志合并回页表；
+        2. 快照全部映射页的 A/D 位（即本次采样结果）；
+        3. 清除页表中的 A/D 位；
+        4. 世代编号加一，并给现存的该 ASID TLB 项盖上新世代戳。
+
+        因此：调用之前的成功访问必然反映在本次采样里；调用之后的访问
+        （无论在 TLB 还是页表路径上置位）只属于下一世代，不会被本次清位
+        抹掉；采样前遗留、采样后才被逐出/失效的 TLB 项因世代戳过期，
+        其迟到回写被丢弃，不会污染新一轮。
+        """
+        sp = self._space(asid)
+        gen = self._gen[sp.asid]
+        for tlb in self._tlb:
+            for (a, vpn), entry in tlb.items():
+                if a == sp.asid:
+                    self._writeback_entry(a, vpn, entry)
+        pages: dict[int, PageFlags] = {}
+        ptes: list[PTE] = []
+        for l1i, l1e in enumerate(sp.l1):
+            base = l1i * HUGE_PAGE_SIZE
+            if isinstance(l1e, PTE):
+                pages[base] = PageFlags(base, l1e.accessed, l1e.dirty, True)
+                ptes.append(l1e)
+            elif isinstance(l1e, list):
+                for l2i, pte in enumerate(l1e):
+                    if pte is not None:
+                        v = base + l2i * PAGE_SIZE
+                        pages[v] = PageFlags(v, pte.accessed, pte.dirty, False)
+                        ptes.append(pte)
+        for pte in ptes:
+            pte.accessed = False
+            pte.dirty = False
+        self._gen[sp.asid] = gen + 1
+        for tlb in self._tlb:
+            for (a, _), entry in tlb.items():
+                if a == sp.asid:
+                    entry.gen = gen + 1
+        return SampleResult(sp.asid, gen, pages)
+
     # ---- 遍历与翻译 ---------------------------------------------------------
     def walk_table(self, asid, vaddr) -> WalkResult | None:
         """无 TLB 遍历器：直接查页表，返回 :class:`WalkResult` 或 None。"""
@@ -521,7 +669,7 @@ class MMU:
             if wr is None:
                 return TranslationResult(False, None, "not_mapped", access.name.lower(),
                                          "walk", sp.asid, va)
-            entry = (wr.ppn, wr.perms, wr.huge)
+            entry = TLBEntry(wr.ppn, wr.perms, wr.huge, gen=self._gen[sp.asid])
             via = "walk"
             # 填入 TLB：大页用 16 对齐的标记 key
             key = (sp.asid, vpn if not wr.huge else (vpn & ~(L2_SIZE - 1)))
@@ -531,7 +679,8 @@ class MMU:
             else:
                 tlb[key] = entry
                 if len(tlb) > TLB_SIZE:
-                    tlb.popitem(last=False)
+                    (ev_asid, ev_vpn), evicted = tlb.popitem(last=False)
+                    self._writeback_entry(ev_asid, ev_vpn, evicted)
 
         ppn, perms, huge = entry
         region = HUGE_PAGE_SIZE if huge else PAGE_SIZE
@@ -544,6 +693,20 @@ class MMU:
         if not (perms & need):
             fault = {PERM_READ: "read", PERM_WRITE: "write", PERM_EXEC: "execute"}[need]
             return TranslationResult(False, None, fault, access.name.lower(), via, sp.asid, va, perms)
+        # 访问成功才置位：A 恒置，写访问再置 D。
+        # walk 路径直接写 PTE（如同硬件遍历置位）；TLB 命中路径先在 TLB 项上
+        # 挂起，采样/逐出/失效时合并回页表。
+        if via == "walk":
+            pte = sp.find_pte(va)
+            if pte is not None:
+                pte.accessed = True
+                if access is AccessType.WRITE:
+                    pte.dirty = True
+        else:
+            entry.gen = self._gen[sp.asid]  # 防御：挂起标志永远归属当前世代
+            entry.pend_a = True
+            if access is AccessType.WRITE:
+                entry.pend_d = True
         off = va & (HUGE_PAGE_MASK if huge else PAGE_MASK)
         return TranslationResult(True, ppn * PAGE_SIZE + off, None, access.name.lower(),
                                  via, sp.asid, va, perms)

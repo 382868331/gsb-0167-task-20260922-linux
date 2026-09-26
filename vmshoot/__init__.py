@@ -31,8 +31,11 @@ from .core import (
     MMU,
     AddressSpace,
     AccessType,
+    PageFlags,
     PTE,
+    SampleResult,
     Ticket,
+    TLBEntry,
     TranslationResult,
     WalkResult,
 )
@@ -75,8 +78,11 @@ __all__ = [
     "AddressSpace",
     "PhysicalMemory",
     "AccessType",
+    "PageFlags",
     "PTE",
+    "SampleResult",
     "Ticket",
+    "TLBEntry",
     "TranslationResult",
     "WalkResult",
     # 常量
