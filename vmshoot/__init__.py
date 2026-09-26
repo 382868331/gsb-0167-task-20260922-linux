@@ -23,6 +23,12 @@
 失败给 ``not_mapped/read/write/execute`` fault；一次访问跨越所在页边界抛
 :class:`CrossPageAccess`。另有 :meth:`MMU.walk_table` 作为“无 TLB 遍历器”
 供验收在全部 ACK 后核对。
+
+A/D 位（访问/脏位）：页表项带 accessed/dirty 位，成功访问置 A、成功写入再置 D；
+TLB 命中同样记账（先记在该核的待回写标志里，合并或该项被移除时写回页表），
+权限失败与未映射访问不留下痕迹。MMU.sample_and_clear 先把各核 TLB
+标志合并回页表，再快照、清位并推进采样世代；旧世代的迟到回写会被丢弃，
+清位后的新访问在下一世代重新记账，不会丢失。
 """
 
 from __future__ import annotations
@@ -31,7 +37,9 @@ from .core import (
     MMU,
     AddressSpace,
     AccessType,
+    PageFlags,
     PTE,
+    SampleResult,
     Ticket,
     TranslationResult,
     WalkResult,
@@ -76,6 +84,8 @@ __all__ = [
     "PhysicalMemory",
     "AccessType",
     "PTE",
+    "PageFlags",
+    "SampleResult",
     "Ticket",
     "TranslationResult",
     "WalkResult",
@@ -110,4 +120,4 @@ __all__ = [
     "TicketError",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

@@ -25,6 +25,7 @@ from .primitives import (
     HUGE_PAGE_MASK,
     HUGE_PAGE_SIZE,
     L1_SIZE,
+    L2_BITS,
     L2_SIZE,
     MAX_ADDRESS_SPACES,
     NUM_CORES,
@@ -58,11 +59,16 @@ class AccessType(IntEnum):
 # ===========================================================================
 @dataclass
 class PTE:
-    """页表项。``huge=True`` 时它是一级叶子，``ppn`` 为 16 对齐的起始帧号。"""
+    """页表项。huge=True 时它是一级叶子，ppn 为 16 对齐的起始帧号。
+
+    accessed / dirty 即 A/D 位：成功访问置 A，成功写入再置 D；
+    只能由 MMU.sample_and_clear 清零（销毁地址空间除外）。"""
 
     ppn: int
     perms: int
     huge: bool = False
+    accessed: bool = False
+    dirty: bool = False
 
 
 @dataclass
@@ -127,17 +133,49 @@ class TranslationResult:
 
 @dataclass
 class WalkResult:
-    """绕过 TLB 的纯页表遍历结果（“无 TLB 遍历器”）。"""
+    """绕过 TLB 的纯页表遍历结果（“无 TLB 遍历器”）。
+
+    accessed / dirty 是遍历瞬间页表项上 A/D 位的快照（只读，不清位）。
+    """
 
     ppn: int
     perms: int
     huge: bool
     vaddr: int
+    accessed: bool = False
+    dirty: bool = False
 
     @property
     def phys_addr(self) -> int:
         off_mask = HUGE_PAGE_MASK if self.huge else PAGE_MASK
         return self.ppn * PAGE_SIZE + (self.vaddr & off_mask)
+
+
+@dataclass
+class PageFlags:
+    """一次采样中单个映射页的 A/D 标志快照（vaddr 为该映射区起始地址）。"""
+
+    vaddr: int
+    huge: bool
+    accessed: bool
+    dirty: bool
+
+
+@dataclass
+class SampleResult:
+    """sample_and_clear 的返回：被采样的世代号 + 全部映射页的 A/D 快照。
+
+    generation 是本次收割的世代号（采样后空间世代已推进到 +1）；
+    pages 是采样瞬间所有映射页的 PageFlags，按地址升序；未映射地址不出现。
+    """
+
+    asid: int
+    generation: int
+    pages: tuple
+
+    def flagged(self):
+        """只列出 A 或 D 被置位的页，便于快速检查。"""
+        return [p for p in self.pages if p.accessed or p.dirty]
 
 
 # ===========================================================================
@@ -148,6 +186,8 @@ class AddressSpace:
         self.asid = asid
         self.mem = mem
         self.l1: list[None | PTE | list] = [None] * L1_SIZE
+        # 采样世代：每次 sample_and_clear 后 +1；TLB 待回写标志用它标记所属世代
+        self.generation = 0
 
     # ---- 遍历 ---------------------------------------------------------------
     def walk(self, vaddr: int) -> WalkResult | None:
@@ -158,11 +198,11 @@ class AddressSpace:
         if isinstance(e, PTE):
             if not e.huge:  # 内部不变量：L1 上的 PTE 必为大页叶子
                 raise AssertionError("内部错误：一级页表中出现非叶子 PTE")
-            return WalkResult(e.ppn, e.perms, True, vaddr)
+            return WalkResult(e.ppn, e.perms, True, vaddr, e.accessed, e.dirty)
         pte = e[l2i]
         if pte is None:
             return None
-        return WalkResult(pte.ppn, pte.perms, False, vaddr)
+        return WalkResult(pte.ppn, pte.perms, False, vaddr, pte.accessed, pte.dirty)
 
     # ---- map ----------------------------------------------------------------
     def map_small(self, vaddr: int, perms: int) -> tuple[PTE, int]:
@@ -263,6 +303,28 @@ class AddressSpace:
         self.l1[l1i] = table
         return table, l2i
 
+    # ---- A/D 位辅助 -----------------------------------------------------------
+    def find_pte(self, vaddr: int) -> PTE | None:
+        """返回覆盖该地址的 PTE 对象本身（小页或大页叶子），未映射为 None。"""
+        l1i, l2i, _ = split_vaddr(vaddr)
+        e = self.l1[l1i]
+        if isinstance(e, PTE):
+            return e
+        if e is None:
+            return None
+        return e[l2i]
+
+    def iter_ptes(self):
+        """按地址升序产生 (起始 vaddr, PTE)——小页 256 对齐，大页 4096 对齐。"""
+        for l1i, l1e in enumerate(self.l1):
+            base = l1i * HUGE_PAGE_SIZE
+            if isinstance(l1e, PTE):
+                yield base, l1e
+            elif isinstance(l1e, list):
+                for l2i, pte in enumerate(l1e):
+                    if pte is not None:
+                        yield base + l2i * PAGE_SIZE, pte
+
     # ---- 销毁 ---------------------------------------------------------------
     def destroy(self) -> None:
         """释放全部帧与页表结构。"""
@@ -302,6 +364,9 @@ class MMU:
         self._spaces: dict[int, AddressSpace] = {}
         # 每核一个 OrderedDict：key=(asid, vpn) -> (ppn, perms, huge)，头部为 LRU
         self._tlb: list[OrderedDict] = [OrderedDict() for _ in range(NUM_CORES)]
+        # 每核 TLB 项的“待回写 A/D 标志”：key=(asid, vpn) -> [accessed, dirty, gen]
+        # TLB 命中时只在这里记账；合并（sample）或项被移除时才写回 PTE。
+        self._tlb_flags: list[dict] = [dict() for _ in range(NUM_CORES)]
         self._tickets: dict[int, Ticket] = {}
         self._next_ticket = 1
 
@@ -358,10 +423,13 @@ class MMU:
         这正是题面“新 ASID 不能复用未完成票据”的约束。全部票据 finish 后编号立即可用。
         """
         sp = self._space(asid)
-        for tlb in self._tlb:
+        for core in range(NUM_CORES):
+            tlb = self._tlb[core]
             dead = [k for k in tlb if k[0] == sp.asid]
             for k in dead:
                 del tlb[k]
+                # 页表即将销毁，A/D 标志随空间一起消失，不写回
+                self._tlb_flags[core].pop(k, None)
         sp.destroy()
         del self._spaces[sp.asid]
 
@@ -401,7 +469,10 @@ class MMU:
             raise TicketError(f"核 {c} 已 ACK 过票据 {tid}，不能重复 ACK")
         tlb = self._tlb[c]
         for k in t.keys:
-            tlb.pop(k, None)
+            if k in tlb:
+                self._writeback_flags(c, k)  # 先把待回写 A/D 标志并入 PTE
+                tlb.pop(k, None)
+            self._tlb_flags[c].pop(k, None)
         t.acks.add(c)
         return t
 
@@ -463,6 +534,79 @@ class MMU:
             )
         sp.protect_small(va, p)
         return self._issue(sp.asid, "protect", va, self._keys_for(sp.asid, va, False))
+
+    # ---- A/D 位：TLB 待回写标志的合并与采样 ----------------------------------
+    def _merge_flags(self, sp: AddressSpace, key, entry, flags) -> None:
+        """把一条 TLB 待回写标志并入页表（若仍有效）。
+
+        * flags 为 [accessed, dirty, gen]；gen 不等于空间当前世代 => 这是迟到
+          的旧世代回写，直接丢弃，不污染新一轮采样；
+        * PTE 不存在（已 unmap）或 ppn 对不上（同一虚拟页已重映射到别的帧）
+          时同样丢弃——旧映射的访问痕迹不应落到新映射上。
+        """
+        if not flags or not (flags[0] or flags[1]):
+            return
+        if flags[2] != sp.generation:
+            return
+        asid, vpn = key
+        l1i = vpn >> L2_BITS
+        l1e = sp.l1[l1i]
+        if entry[2]:  # huge：key 是 16 对齐的标记 vpn
+            pte = l1e if isinstance(l1e, PTE) else None
+        else:
+            pte = l1e[vpn & (L2_SIZE - 1)] if isinstance(l1e, list) else None
+        if pte is None or pte.ppn != entry[0]:
+            return
+        pte.accessed = True
+        if flags[1]:
+            pte.dirty = True
+
+    def _writeback_flags(self, core: int, key) -> None:
+        """TLB 项被移除（ACK 失效 / LRU 淘汰）前，把它的待回写标志并入页表。"""
+        flags = self._tlb_flags[core].get(key)
+        entry = self._tlb[core].get(key)
+        sp = self._spaces.get(key[0])
+        if sp is not None and entry is not None:
+            self._merge_flags(sp, key, entry, flags)
+
+    def sample_generation(self, asid) -> int:
+        """当前采样世代号（下次 sample_and_clear 将收割的世代）。"""
+        return self._space(asid).generation
+
+    def sample_and_clear(self, asid) -> SampleResult:
+        """采样并清零该地址空间全部映射页的 A/D 位，返回采样快照。
+
+        步骤（对本模拟的同步执行模型而言整体是一个原子操作，线性化点即本次
+        调用；调用之前已成功的访问属于被收割的世代，调用返回后的访问属于下一
+        世代）：
+
+        1. 合并：让每个核把该 ASID 的 TLB 待回写标志写回 PTE，并把各核该项的
+           待回写标志清空、世代戳推进到新世代——因此旧项之后被淘汰/失效时不会
+           把旧世代的标志再次写回（迟到的旧世代回写不污染下一轮）；
+        2. 快照：读取所有映射页 PTE 的 A/D 位；
+        3. 清位：PTE 的 A/D 位清零；
+        4. 推进采样世代（generation + 1）。
+
+        清位之后发生的新访问会在各核 TLB 里以新世代重新记账，或在 walk 时直接
+        置 PTE 位，都不会丢失，也不会被本次清位误清。
+        """
+        sp = self._space(asid)
+        gen = sp.generation
+        for core in range(NUM_CORES):
+            tlb = self._tlb[core]
+            flags_map = self._tlb_flags[core]
+            for key, entry in list(tlb.items()):
+                if key[0] != sp.asid:
+                    continue
+                self._merge_flags(sp, key, entry, flags_map.get(key))
+                flags_map[key] = [False, False, gen + 1]
+        pages = []
+        for vaddr, pte in sp.iter_ptes():
+            pages.append(PageFlags(vaddr, pte.huge, pte.accessed, pte.dirty))
+            pte.accessed = False
+            pte.dirty = False
+        sp.generation = gen + 1
+        return SampleResult(sp.asid, gen, tuple(pages))
 
     # ---- TLB ----------------------------------------------------------------
     def tlb_keys(self, core_id) -> list[tuple[int, int]]:
@@ -530,8 +674,12 @@ class MMU:
                 tlb.move_to_end(key)
             else:
                 tlb[key] = entry
+                self._tlb_flags[core][key] = [False, False, sp.generation]
                 if len(tlb) > TLB_SIZE:
-                    tlb.popitem(last=False)
+                    evicted = next(iter(tlb))
+                    self._writeback_flags(core, evicted)  # 淘汰前回写 A/D 标志
+                    del tlb[evicted]
+                    self._tlb_flags[core].pop(evicted, None)
 
         ppn, perms, huge = entry
         region = HUGE_PAGE_SIZE if huge else PAGE_SIZE
@@ -544,6 +692,21 @@ class MMU:
         if not (perms & need):
             fault = {PERM_READ: "read", PERM_WRITE: "write", PERM_EXEC: "execute"}[need]
             return TranslationResult(False, None, fault, access.name.lower(), via, sp.asid, va, perms)
+        # 成功访问才置 A，成功写入再置 D；权限失败/未映射在上面已经返回，
+        # 不会留下任何成功访问痕迹。TLB 命中记到该核的待回写标志（合并或该项
+        # 被移除时写回 PTE）；walk 路径直接置 PTE 位。
+        if via == "tlb":
+            fl = self._tlb_flags[core].setdefault(
+                hit_key, [False, False, sp.generation])
+            fl[0] = True
+            if need == PERM_WRITE:
+                fl[1] = True
+        else:
+            pte = sp.find_pte(va)
+            if pte is not None:
+                pte.accessed = True
+                if need == PERM_WRITE:
+                    pte.dirty = True
         off = va & (HUGE_PAGE_MASK if huge else PAGE_MASK)
         return TranslationResult(True, ppn * PAGE_SIZE + off, None, access.name.lower(),
                                  via, sp.asid, va, perms)
