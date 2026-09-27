@@ -12,12 +12,22 @@
 失效协议（map/unmap/protect）：
 
 1. 先更新页表；
-2. 产生一张 :class:`Ticket`，列出需要失效的 TLB key 与全部目标核；
-3. ACK 之前，其他核上的旧 TLB 项允许继续存在并被观察到（陈旧翻译）；
-4. 每个目标核调用 :meth:`MMU.ack` 后该项才从该核 TLB 移除；
-5. :meth:`MMU.finish` 必须等待所有目标核 ACK，否则抛
-   :class:`InvalidationsPending`。
-6. 被销毁/重建的 ASID 号在仍有未 finish 票据时不能复用（:class:`AsidBusy`）。
+2. 产生一张 :class:`Ticket`，列出需要失效的 TLB key 与**实际通知的核**
+   （``targets`` / :attr:`Ticket.notified_cores`）：只通知“确实可能缓存过该
+   地址空间”的参与核，判断依据不足时保守扩大，但绝不漏通知；
+3. 参与范围随三种事件更新：核切换地址空间（:meth:`MMU.switch_to`）、核第一次
+   进入某地址空间（显式切换，或一次成功翻译导致的 TLB 填充）、以及旧票据的
+   “迟到确认”（非目标核对未完成票据 ACK：把该核保守补入参与范围，并扩展该
+   ASID 上所有在途后续票据的目标核）；
+4. ACK 之前，被通知核上的旧 TLB 项允许继续存在并被观察到（陈旧翻译）；
+5. 每个被通知核调用 :meth:`MMU.ack` 后该项才从该核 TLB 移除；未被通知的核
+   若送来迟到 ACK，按第 3 条处理而不是报错丢弃；
+6. :meth:`MMU.finish` 必须等待所有实际通知核 ACK，否则抛
+   :class:`InvalidationsPending`；
+7. ``unmap`` 摘下的物理帧在所有被通知核 ACK + finish 之前**不回收到帧池**，
+   旧物理页不会被提前复用；没有任何参与核时票据目标为空，帧在摘表时即可安全
+   回收，票据发票即关闭；
+8. 被销毁/重建的 ASID 号在仍有未 finish 票据时不能复用（:class:`AsidBusy`）。
 
 翻译：:meth:`MMU.translate` 返回 :class:`TranslationResult`，成功给物理地址，
 失败给 ``not_mapped/read/write/execute`` fault；一次访问跨越所在页边界抛

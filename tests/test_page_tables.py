@@ -30,6 +30,15 @@ def ppn_of(wr) -> int:
     return wr.ppn
 
 
+def settle(mmu, ticket) -> None:
+    """按票据实际通知的核 ACK 并 finish；无目标核的票据已直接关闭。"""
+    if ticket.closed:
+        return
+    for core in ticket.notified_cores:
+        mmu.ack(core, ticket.id)
+    mmu.finish(ticket.id)
+
+
 class TestAddressLifecycle(unittest.TestCase):
     def setUp(self):
         self.mmu = MMU()
@@ -97,13 +106,44 @@ class TestSmallPages(unittest.TestCase):
         self.assertIsNone(self.mmu.walk_table(self.asid, 0x0000))
 
     def test_unmap_and_frame_reuse(self):
-        self.mmu.map(self.asid, 0x0000, PERM_RW)  # ppn 0
-        self.mmu.map(self.asid, 0x0100, PERM_RW)  # ppn 1
-        self.mmu.unmap(self.asid, 0x0000)
+        t0 = self.mmu.map(self.asid, 0x0000, PERM_RW)  # ppn 0
+        t1 = self.mmu.map(self.asid, 0x0100, PERM_RW)  # ppn 1
+        settle(self.mmu, t0)
+        settle(self.mmu, t1)
+        tu = self.mmu.unmap(self.asid, 0x0000)
         self.assertIsNone(self.mmu.walk_table(self.asid, 0x0000))
-        self.mmu.map(self.asid, 0x0200, PERM_RW)  # 首位适配：重新拿到 ppn 0
+        # 没有任何核进入过该空间：失效请求目标为空，帧在摘表时即可安全回收
+        self.assertEqual(tu.notified_cores, ())
+        settle(self.mmu, tu)
+        tn = self.mmu.map(self.asid, 0x0200, PERM_RW)  # 首位适配：重新拿到 ppn 0
+        settle(self.mmu, tn)
         self.assertEqual(self.mmu.walk_table(self.asid, 0x0200).ppn, 0)
         self.assertEqual(self.mmu.walk_table(self.asid, 0x0100).ppn, 1)
+
+    def test_unmap_frame_not_reused_until_target_acks(self):
+        """旧物理页在所有实际参与核 ACK + finish 前不得复用。"""
+        from vmshoot import AccessType
+        t0 = self.mmu.map(self.asid, 0x0000, PERM_RW)
+        settle(self.mmu, t0)
+        # 只有核 0 进入并缓存了该空间
+        self.mmu.switch_to(0, self.asid)
+        self.mmu.translate(self.asid, 0, 0x0000, AccessType.READ)
+        tu = self.mmu.unmap(self.asid, 0x0000)
+        # 只通知核 0；finish 前旧帧 ppn=0 仍占用，新映射只能拿 ppn=1
+        self.assertEqual(tu.notified_cores, (0,))
+        self.assertEqual(self.mmu.mem.used_frames(), 1)
+        with self.assertRaises(Exception):
+            self.mmu.finish(tu.id)
+        tnew = self.mmu.map(self.asid, 0x0200, PERM_RW)
+        settle(self.mmu, tnew)
+        self.assertEqual(self.mmu.walk_table(self.asid, 0x0200).ppn, 1)
+        self.mmu.ack(0, tu.id)
+        self.mmu.finish(tu.id)
+        # finish 后 ppn=0 才回到空闲池
+        self.assertEqual(self.mmu.mem.used_frames(), 1)
+        tnew2 = self.mmu.map(self.asid, 0x0300, PERM_RW)
+        settle(self.mmu, tnew2)
+        self.assertEqual(self.mmu.walk_table(self.asid, 0x0300).ppn, 0)
 
     def test_unmap_not_mapped(self):
         with self.assertRaises(NotMapped):
@@ -161,8 +201,10 @@ class TestHugePages(unittest.TestCase):
         self.assertTrue(wr.huge)
 
     def test_unmap_huge_base_releases_all_frames(self):
-        self.mmu.map(self.asid, 0x0000, PERM_RW, huge=True)
-        self.mmu.unmap(self.asid, 0x0000)
+        t = self.mmu.map(self.asid, 0x0000, PERM_RW, huge=True)
+        settle(self.mmu, t)
+        tu = self.mmu.unmap(self.asid, 0x0000)
+        settle(self.mmu, tu)
         self.assertIsNone(self.mmu.walk_table(self.asid, 0x0000))
         self.assertEqual(self.mmu.mem.used_frames(), 0)
 

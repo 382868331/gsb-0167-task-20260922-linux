@@ -71,8 +71,10 @@ class Ticket:
 
     * ``kind``：``map`` / ``unmap`` / ``protect``；
     * ``keys``：需要失效的 TLB key（小页粒度的 ``(asid, vpn)``）；
-    * ``targets``：必须 ACK 的核（本实现中恒为全部核）；
-    * ``acks``：已 ACK 的核集合；
+    * ``targets``：实际收到失效请求、必须 ACK 的核。目标集在发票时按
+      “确实可能缓存过该地址空间”的参与范围快照得出（判断依据不足时保守扩大），
+      不再恒为全部核；迟到的旧 ACK 表明此前漏判时可在后续票据上动态扩展；
+    * ``acks``：已 ACK 的核集合（含迟到 ACK）；
     * 票据在 :meth:`MMU.finish` 成功后关闭并从活动票据表移除。
     """
 
@@ -81,9 +83,12 @@ class Ticket:
     kind: str
     vaddr: int
     keys: tuple[tuple[int, int], ...]
-    targets: tuple[int, ...]
+    targets: list[int]
     acks: set[int] = field(default_factory=set)
     closed: bool = False
+    # unmap 摘下的帧；在 finish（所有目标核 ACK）后才允许回收到帧池，
+    # 防止“旧物理页被提前复用”。None 表示该票据不涉及帧回收。
+    deferred_frames: tuple[int, ...] | None = None
 
     @property
     def pending(self) -> tuple[int, ...]:
@@ -92,6 +97,11 @@ class Ticket:
     @property
     def done(self) -> bool:
         return not self.pending
+
+    @property
+    def notified_cores(self) -> tuple[int, ...]:
+        """实际通知（必须等待 ACK）的核，按核号升序。"""
+        return tuple(sorted(self.targets))
 
 
 @dataclass
@@ -219,17 +229,16 @@ class AddressSpace:
                     "或先 protect 拆分后再逐页 unmap"
                 )
             pte = l1e
-            self.l1[l1i] = None       # 先摘表，再释放帧
-            self.mem.free_huge(pte.ppn)
-            return pte, True
+            self.l1[l1i] = None       # 只摘表；帧的回收延迟到票据 finish
+            frames = tuple(pte.ppn + j for j in range(L2_SIZE))
+            return pte, True, frames
         if l1e is None or l1e[l2i] is None:
             raise NotMapped(f"vaddr=0x{vaddr:x} 没有映射")
         pte = l1e[l2i]
-        l1e[l2i] = None              # 先摘表，再释放帧
-        self.mem.free_frame(pte.ppn)
+        l1e[l2i] = None              # 只摘表；帧的回收延迟到票据 finish
         if all(x is None for x in l1e):
             self.l1[l1i] = None  # 回收空的二级表
-        return pte, False
+        return pte, False, (pte.ppn,)
 
     # ---- protect ------------------------------------------------------------
     def protect_small(self, vaddr: int, perms: int) -> PTE:
@@ -304,6 +313,12 @@ class MMU:
         self._tlb: list[OrderedDict] = [OrderedDict() for _ in range(NUM_CORES)]
         self._tickets: dict[int, Ticket] = {}
         self._next_ticket = 1
+        # 每个地址空间一个“参与核”集合：其中的核确实（或无法排除地）可能在
+        # 该 ASID 上缓存过 TLB 项。票据目标核 = 参与核 ∪ 该 ASID 上所有未完成
+        # 票据的目标核（后者保证旧票据迟到 ACK 前，后续票据不漏等任何核）。
+        self._participants: dict[int, set[int]] = {}
+        # 每核当前运行的地址空间；None 表示该核未运行在任何地址空间。
+        self._current_asid: list[int | None] = [None] * NUM_CORES
 
     # ---- 基础校验 -----------------------------------------------------------
     @staticmethod
@@ -344,6 +359,7 @@ class MMU:
                 continue
             sp = AddressSpace(cand, self.mem)
             self._spaces[cand] = sp
+            self._participants[cand] = set()  # 清掉销毁后迟到 ACK 留下的残留集合
             return cand
         raise AsidBusy(busy[0], self._pending_for_asid(busy[0]))
 
@@ -364,18 +380,95 @@ class MMU:
                 del tlb[k]
         sp.destroy()
         del self._spaces[sp.asid]
+        # 该空间已不存在：参与核集合随之撤销，每核的“当前空间”若指向它则置空。
+        self._participants.pop(sp.asid, None)
+        for core in range(NUM_CORES):
+            if self._current_asid[core] == sp.asid:
+                self._current_asid[core] = None
 
     # ---- 票据 ---------------------------------------------------------------
-    def _issue(self, asid: int, kind: str, vaddr: int, keys: tuple) -> Ticket:
+    def _core_holds_asid_keys(self, core: int, asid: int) -> bool:
+        """该核 TLB 中当前是否还有属于 ``asid`` 的 key。"""
+        return any(k[0] == asid for k in self._tlb[core].keys())
+
+    def _shrink_participants(self, asid: int) -> None:
+        """从参与范围中移除确定不可能再持有该 ASID 旧项的核。
+
+        移除判据（两者同时满足，依据不足则保守保留）：
+
+        1. 该核 TLB 中已没有任何该 ASID 的 key（陈旧项已被 ACK/淘汰/冲刷清空）；
+        2. 该核不是该 ASID 上任何未完成票据的目标核
+           （它可能正持有对更早票据的“迟到 ACK”，在 ACK 真正到达前不能漏等）。
+        """
+        group = self._participants.get(asid)
+        if not group:
+            return
+        stale_targets: set[int] = set()
+        for t in self._tickets.values():
+            if t.asid == asid and not t.closed:
+                stale_targets.update(t.targets)
+        for core in range(NUM_CORES):
+            if core not in group or core in stale_targets:
+                continue
+            # 移出需要同时具备：核已显式切走（current 不是该空间）、TLB 中该
+            # 空间 key 已清空。仍正运行在该空间、或 TLB 仍有 key（含切出后靠
+            # ASID 保留的缓存）都必须保留。从未显式 switch_to 过的核其 current
+            # 为 None，但缺少“切出”这一明确证据，也保守保留，不漏通知。
+            if self._current_asid[core] is not None \
+                    and self._current_asid[core] != asid \
+                    and not self._core_holds_asid_keys(core, asid):
+                group.discard(core)
+
+    def _snapshot_targets(self, asid: int) -> list[int]:
+        """计算新票据的目标核：参与核 ∪ 该 ASID 未完成票据的全部目标核。
+
+        参与核覆盖“核心切换地址空间、第一次进入地址空间、翻译填充过 TLB”的
+        所有来源；未完成票据目标核的并集保证：更早票据的 ACK 迟到时，新票据
+        不会漏掉任何可能仍持有旧项、需要被通知的核。
+        """
+        self._shrink_participants(asid)
+        targets = set(self._participants.get(asid, ()))
+        for t in self._tickets.values():
+            if t.asid == asid and not t.closed:
+                targets.update(t.targets)
+        return sorted(targets)
+
+    def _release_frames(self, ppns: tuple[int, ...]) -> None:
+        """finish 后回收 unmap 延迟释放的帧。
+
+        小页票据可能只有 1 帧；大页 16 帧且 16 对齐。统一逐帧释放：
+        这些帧在摘表时已从所有活动页表移除，此刻所有目标核也已 ACK，
+        旧物理页才允许被首位适配重新分配。
+        """
+        if len(ppns) == L2_SIZE and ppns[0] % L2_SIZE == 0 and \
+                ppns == tuple(range(ppns[0], ppns[0] + L2_SIZE)):
+            self.mem.free_huge(ppns[0])
+        else:
+            for ppn in ppns:
+                self.mem.free_frame(ppn)
+
+    def _issue(self, asid: int, kind: str, vaddr: int, keys: tuple,
+               deferred_frames: tuple[int, ...] | None = None) -> Ticket:
+        targets = self._snapshot_targets(asid)
         t = Ticket(
             id=self._next_ticket,
             asid=asid,
             kind=kind,
             vaddr=vaddr,
             keys=tuple(keys),
-            targets=tuple(range(NUM_CORES)),
+            targets=targets,
+            deferred_frames=deferred_frames,
         )
         self._next_ticket += 1
+        # 无任何核可能缓存过该空间（TLB 可证为空且无未完成票据目标）：
+        # 不发任何失效请求；unmap 的旧帧此刻可安全立即回收，票据直接关闭，
+        # 不进入活动票据表（finish/ack 未知票据的既有语义随之适用）。
+        if not targets:
+            if deferred_frames is not None:
+                self._release_frames(deferred_frames)
+                t.deferred_frames = None
+            t.closed = True
+            return t
         self._tickets[t.id] = t
         return t
 
@@ -389,20 +482,44 @@ class MMU:
         return ((asid, vaddr >> PAGE_BITS),)
 
     def ack(self, core_id, ticket_id) -> Ticket:
-        """核 ``core_id`` 确认票据：立刻从该核 TLB 移除票据所列 key。"""
+        """核 ``core_id`` 确认票据：立刻从该核 TLB 移除票据所列 key。
+
+        若该核**不在**发票时快照的目标核里，这是一张“迟到的旧确认”：它证明
+        此前的参与范围判断依据不足、该核确实缓存过该地址空间。此时不报错、
+        也不丢确认，而是：
+
+        1. 照样清掉该核上票据所列 key；
+        2. 把该核保守补入该 ASID 的参与范围；
+        3. 把该核扩展为该 ASID 上所有仍未 finish 的后续票据的目标核
+           （当前票据也立即把它记为已响应，不重复等待）。
+
+        这样参与范围只可能因证据而扩大、绝不会漏通知。
+        """
         c = self._check_core(core_id)
         tid = validate_int(ticket_id, "ticket_id")
         t = self._tickets.get(tid)
         if t is None:
             raise TicketError(f"票据 {tid} 不存在或已关闭")
-        if c not in t.targets:
-            raise TicketError(f"核 {c} 不是票据 {tid} 的目标核")
         if c in t.acks:
             raise TicketError(f"核 {c} 已 ACK 过票据 {tid}，不能重复 ACK")
         tlb = self._tlb[c]
         for k in t.keys:
             tlb.pop(k, None)
         t.acks.add(c)
+        if c not in t.targets:
+            # 迟到的旧确认：扩大参与范围并补进所有未完成的同空间票据。
+            group = self._participants.setdefault(t.asid, set())
+            group.add(c)
+            t.targets.append(c)
+            for other in self._tickets.values():
+                if other.asid == t.asid and not other.closed and c not in other.targets:
+                    other.targets.append(c)
+                    # 只有当后续票据所列 key 都已被本次 ACK 清空（key 集合被
+                    # 包含，例如同一页的连续 protect），才顺带视为已响应；
+                    # 否则该核仍需对自己那份失效请求单独 ACK。
+                    if set(other.keys).issubset(set(t.keys)):
+                        other.acks.add(c)
+        self._shrink_participants(t.asid)
         return t
 
     def finish(self, ticket_id) -> Ticket:
@@ -414,7 +531,12 @@ class MMU:
         if t.pending:
             raise InvalidationsPending(tid, t.pending)
         t.closed = True
+        if t.deferred_frames is not None:
+            # 所有实际持有旧缓存可能的核都已 ACK：旧物理页此刻才允许复用。
+            self._release_frames(t.deferred_frames)
+            t.deferred_frames = None
         del self._tickets[tid]
+        self._shrink_participants(t.asid)
         return t
 
     def pending_tickets(self, asid=None) -> list[int]:
@@ -422,6 +544,39 @@ class MMU:
             return [t.id for t in self._tickets.values()]
         a = validate_int(asid, "asid")
         return self._pending_for_asid(a)
+
+    # ---- 核心地址空间切换（参与范围维护） ----------------------------------
+    def switch_to(self, core_id, asid) -> None:
+        """让核 ``core_id`` 切换（或第一次进入）地址空间 ``asid``。
+
+        这是参与范围的显式来源：
+
+        * **第一次进入某个地址空间 / 切入**：该核成为该 ASID 的参与核——它
+          随后随时可能填入该空间的翻译，后续失效请求必须通知它（保守）。
+        * **切出旧地址空间**：仅当该核 TLB 中已没有旧空间的任何 key、且它也不
+          在旧空间未完成票据的目标列表里时，才把它移出旧空间的参与范围；
+          依据不足时保守保留，绝不在无法证伪缓存时漏通知。
+
+        本模拟不冲刷 TLB（key 含 ASID，硬件切 ASID 通常保留缓存），因此切出
+        后仍持有旧 key 的核继续留在参与范围内，直到对应 ACK/淘汰清空。
+        """
+        core = self._check_core(core_id)
+        sp = self._space(asid)
+        old = self._current_asid[core]
+        if old is not None and old != sp.asid:
+            self._shrink_participants(old)
+        self._participants.setdefault(sp.asid, set()).add(core)
+        self._current_asid[core] = sp.asid
+
+    def current_address_space(self, core_id) -> int | None:
+        """诊断用：核当前运行的 ASID（从未 :meth:`switch_to` 过则为 None）。"""
+        core = self._check_core(core_id)
+        return self._current_asid[core]
+
+    def participants(self, asid) -> tuple[int, ...]:
+        """诊断用：该地址空间当前“可能缓存过它”的参与核（升序）。"""
+        sp = self._space(asid)
+        return tuple(sorted(self._participants.get(sp.asid, ())))
 
     # ---- map / unmap / protect（先改表，后发票） ----------------------------
     def map(self, asid, vaddr, perms, *, huge: bool = False) -> Ticket:
@@ -439,8 +594,10 @@ class MMU:
     def unmap(self, asid, vaddr) -> Ticket:
         sp = self._space(asid)
         va = validate_vaddr(vaddr, "vaddr")
-        _, huge = sp.unmap(va)
-        return self._issue(sp.asid, "unmap", va, self._keys_for(sp.asid, va, huge))
+        _, huge, frames = sp.unmap(va)
+        return self._issue(sp.asid, "unmap", va,
+                           self._keys_for(sp.asid, va, huge),
+                           deferred_frames=frames)
 
     def protect(self, asid, vaddr, perms) -> Ticket:
         """改权限。``vaddr`` 必须 256 对齐（不做静默向下取整）。
@@ -532,6 +689,9 @@ class MMU:
                 tlb[key] = entry
                 if len(tlb) > TLB_SIZE:
                     tlb.popitem(last=False)
+            # 一次成功的遍历填充证明该核确实缓存了该空间：登记为参与核。
+            self._participants.setdefault(sp.asid, set()).add(core)
+            self._current_asid[core] = sp.asid
 
         ppn, perms, huge = entry
         region = HUGE_PAGE_SIZE if huge else PAGE_SIZE

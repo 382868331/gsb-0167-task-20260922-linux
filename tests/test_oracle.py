@@ -50,6 +50,8 @@ class RefMMU:
         self.tlb: list[OrderedDict] = [OrderedDict() for _ in range(2)]
         self.tickets: dict[int, dict] = {}
         self.next_id = 1
+        self.participants: dict[int, set] = {}
+        self.current: list[int | None] = [None, None]
 
     # ---- 帧：独立首位适配 ----------------------------------------------
     def alloc_small(self) -> int:
@@ -78,6 +80,7 @@ class RefMMU:
             if any(t["asid"] == cand for t in self.tickets.values()):
                 continue
             self.spaces[cand] = [None] * 16
+            self.participants[cand] = set()
             return cand
         raise AsidBusy(0, [])
 
@@ -93,9 +96,50 @@ class RefMMU:
                     if pte is not None:
                         self.used[pte[0]] = False
         del self.spaces[asid]
+        self.participants.pop(asid, None)
+        for c in range(2):
+            if self.current[c] == asid:
+                self.current[c] = None
         for tlb in self.tlb:
             for k in [k for k in tlb if k[0] == asid]:
                 del tlb[k]
+
+    # ---- 参与范围（独立朴素实现） --------------------------------------
+    def _holds_keys(self, core: int, asid: int) -> bool:
+        return any(k[0] == asid for k in self.tlb[core].keys())
+
+    def _shrink(self, asid: int) -> None:
+        group = self.participants.get(asid)
+        if not group:
+            return
+        stale = set()
+        for t in self.tickets.values():
+            if t["asid"] == asid:
+                stale.update(t["targets"])
+        for c in range(2):
+            if c in group and c not in stale \
+                    and self.current[c] is not None and self.current[c] != asid \
+                    and not self._holds_keys(c, asid):
+                group.discard(c)
+
+    def _snapshot(self, asid: int) -> list[int]:
+        self._shrink(asid)
+        targets = set(self.participants.get(asid, ()))
+        for t in self.tickets.values():
+            if t["asid"] == asid:
+                targets.update(t["targets"])
+        return sorted(targets)
+
+    def switch(self, core: int, asid: int) -> None:
+        old = self.current[core]
+        if old is not None and old != asid:
+            self._shrink(old)
+        self.participants.setdefault(asid, set()).add(core)
+        self.current[core] = asid
+
+    def _release(self, frames) -> None:
+        for ppn in frames:
+            self.used[ppn] = False
 
     # ---- 遍历 -----------------------------------------------------------
     def walk(self, asid: int, va: int):
@@ -110,11 +154,20 @@ class RefMMU:
         return None if pte is None else (pte[0], pte[1], False)
 
     # ---- 结构操作 -------------------------------------------------------
-    def issue(self, asid, kind, va, keys) -> int:
+    def issue(self, asid, kind, va, keys, frames=None) -> int:
         tid = self.next_id
         self.next_id += 1
-        self.tickets[tid] = {"asid": asid, "kind": kind, "va": va,
-                             "keys": tuple(keys), "acks": set()}
+        targets = self._snapshot(asid)
+        t = {"asid": asid, "kind": kind, "va": va, "keys": tuple(keys),
+             "acks": set(), "targets": list(targets), "frames": frames,
+             "closed": False}
+        if not targets:
+            if frames is not None:
+                self._release(frames)
+                t["frames"] = None
+            t["closed"] = True
+            return tid
+        self.tickets[tid] = t
         return tid
 
     @staticmethod
@@ -158,18 +211,18 @@ class RefMMU:
             if l2i != 0:
                 raise MappingConflict("ref huge interior")
             _, base, _ = e
-            for j in range(16):
-                self.used[base + j] = False
             self.spaces[asid][l1i] = None
-            return self.issue(asid, "unmap", va, self.keys_for(asid, va, True))
+            frames = tuple(range(base, base + 16))
+            return self.issue(asid, "unmap", va,
+                              self.keys_for(asid, va, True), frames)
         if e is None or e[l2i] is None:
             raise NotMapped("ref")
         ppn = e[l2i][0]
-        self.used[ppn] = False
         e[l2i] = None
         if all(x is None for x in e):
             self.spaces[asid][l1i] = None
-        return self.issue(asid, "unmap", va, self.keys_for(asid, va, False))
+        return self.issue(asid, "unmap", va,
+                          self.keys_for(asid, va, False), (ppn,))
 
     def protect(self, asid, va, perms) -> int:
         if va & 0xFF:
@@ -197,15 +250,27 @@ class RefMMU:
         for k in t["keys"]:
             self.tlb[core].pop(k, None)
         t["acks"].add(core)
+        if core not in t["targets"]:
+            self.participants.setdefault(t["asid"], set()).add(core)
+            t["targets"].append(core)
+            for other in self.tickets.values():
+                if other["asid"] == t["asid"] and core not in other["targets"]:
+                    other["targets"].append(core)
+                    if set(other["keys"]).issubset(set(t["keys"])):
+                        other["acks"].add(core)
+        self._shrink(t["asid"])
 
     def finish(self, tid) -> None:
         t = self.tickets.get(tid)
         if t is None:
             raise TicketError("ref finished")
-        if t["acks"] != {0, 1}:
-            raise InvalidationsPending(
-                tid, tuple(c for c in (0, 1) if c not in t["acks"]))
+        pending = tuple(c for c in t["targets"] if c not in t["acks"])
+        if pending:
+            raise InvalidationsPending(tid, pending)
+        if t["frames"] is not None:
+            self._release(t["frames"])
         del self.tickets[tid]
+        self._shrink(t["asid"])
 
     # ---- 翻译 -----------------------------------------------------------
     def translate(self, asid, core, va, need_bit, length):
@@ -239,6 +304,8 @@ class RefMMU:
                 tlb[key] = entry
                 if len(tlb) > 8:
                     tlb.popitem(last=False)
+            self.participants.setdefault(asid, set()).add(core)
+            self.current[core] = asid
         ppn, perms, huge = entry
         region = 4096 if huge else 256
         if (va & (region - 1)) + length > region:
@@ -260,6 +327,10 @@ def _ref_create(m):
 
 def _ref_destroy(m, asid):
     return m.destroy(asid) if isinstance(m, RefMMU) else m.destroy_address_space(asid)
+
+
+def _ref_switch(m, core, asid):
+    return m.switch(core, asid) if isinstance(m, RefMMU) else m.switch_to(core, asid)
 
 
 class TestDifferential(unittest.TestCase):
@@ -293,6 +364,14 @@ class TestDifferential(unittest.TestCase):
             for k in ref.tlb[core]:
                 self.assertEqual(sut._tlb[core][k], ref.tlb[core][k])
 
+    def _assert_participants_match(self, sut: MMU, ref: RefMMU):
+        self.assertEqual(sorted(sut._participants), sorted(ref.participants))
+        for asid in ref.participants:
+            self.assertEqual(
+                sorted(sut._participants[asid]), sorted(ref.participants[asid]),
+                f"asid={asid} 参与核不一致")
+        self.assertEqual(sut._current_asid, ref.current)
+
     # ---- 双跑比较器 ------------------------------------------------------
     def _cmp_void(self, fn, sut, ref):
         try:
@@ -321,11 +400,15 @@ class TestDifferential(unittest.TestCase):
                 fn(sut)
             return
         st = fn(sut)
-        rt = ref.tickets[rid]
         self.assertEqual(st.id, rid)
-        self.assertEqual(st.keys, rt["keys"])
-        self.assertEqual(st.targets, (0, 1))
-        self.assertEqual(st.asid, rt["asid"])
+        rt = ref.tickets.get(rid)
+        if rt is None:
+            self.assertTrue(st.closed)
+            self.assertEqual(st.notified_cores, ())
+        else:
+            self.assertEqual(st.keys, rt["keys"])
+            self.assertEqual(st.notified_cores, tuple(rt["targets"]))
+            self.assertEqual(st.asid, rt["asid"])
 
     def _cmp_translate(self, sut, ref, asid, core, va, acc, length):
         try:
@@ -360,6 +443,11 @@ class TestDifferential(unittest.TestCase):
                 elif r < 0.12 and active:
                     a = rng.choice(active)
                     self._cmp_void(lambda m, a=a: _ref_destroy(m, a), sut, ref)
+                elif r < 0.20 and active:
+                    a = rng.choice(active)
+                    core = rng.randrange(2)
+                    self._cmp_void(
+                        lambda m, c=core, a=a: _ref_switch(m, c, a), sut, ref)
                 elif r < 0.40 and active:
                     a = rng.choice(active)
                     huge = rng.random() < 0.35
@@ -404,15 +492,16 @@ class TestDifferential(unittest.TestCase):
 
         # 收尾：ACK 并 finish 全部票据，做最终全量核对
         for tid in sorted(ref.tickets):
-            for core in range(2):
-                if core not in ref.tickets[tid]["acks"]:
-                    ref.ack(core, tid)
-                    sut.ack(core, tid)
+            for core in sorted(c for c in ref.tickets[tid]["targets"]
+                               if c not in ref.tickets[tid]["acks"]):
+                ref.ack(core, tid)
+                sut.ack(core, tid)
             ref.finish(tid)
             sut.finish(tid)
         self.assertEqual(sut.pending_tickets(), [])
         self._assert_walks_match(sut, ref)
         self._assert_tlb_match(sut, ref)
+        self._assert_participants_match(sut, ref)
         self.assertEqual(sut.mem.used_frames(), ref.used_frames())
 
 
