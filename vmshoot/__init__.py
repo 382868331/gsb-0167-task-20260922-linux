@@ -9,15 +9,19 @@
 * 最多 4 个活动地址空间（ASID 0..3）。物理内存只是 Python 内的位图模拟，
   不调用任何 OS 映射（无 mmap）。
 
-失效协议（map/unmap/protect）：
+选择性失效协议（map/unmap/protect）：
 
 1. 先更新页表；
-2. 产生一张 :class:`Ticket`，列出需要失效的 TLB key 与全部目标核；
-3. ACK 之前，其他核上的旧 TLB 项允许继续存在并被观察到（陈旧翻译）；
-4. 每个目标核调用 :meth:`MMU.ack` 后该项才从该核 TLB 移除；
-5. :meth:`MMU.finish` 必须等待所有目标核 ACK，否则抛
-   :class:`InvalidationsPending`。
-6. 被销毁/重建的 ASID 号在仍有未 finish 票据时不能复用（:class:`AsidBusy`）。
+2. 维护每 ASID 的参与核集合（当前运行该空间 / TLB 现存其 key / 尚欠其票据 ACK
+   三条件，保守不漏）；切换地址空间、首次进入与旧确认迟到都会重估范围；
+3. 产生一张 :class:`Ticket`，列出需要失效的 TLB key 与**实际目标核**（只含参与
+   核；无参与核时目标为空）；
+4. ACK 之前，被通知核上的旧 TLB 项允许继续存在并被观察到（陈旧翻译）；
+5. 每个实际目标核调用 :meth:`MMU.ack` 后该项才从该核 TLB 移除；
+6. :meth:`MMU.finish` 必须等待所有实际目标核 ACK，否则抛
+   :class:`InvalidationsPending`；unmap 的旧物理帧只在 finish 时回收，不会提前
+   复用；
+7. 被销毁/重建的 ASID 号在仍有未 finish 票据时不能复用（:class:`AsidBusy`）。
 
 翻译：:meth:`MMU.translate` 返回 :class:`TranslationResult`，成功给物理地址，
 失败给 ``not_mapped/read/write/execute`` fault；一次访问跨越所在页边界抛
@@ -35,6 +39,7 @@ from .core import (
     Ticket,
     TranslationResult,
     WalkResult,
+    InvalidationNotice,
 )
 from .errors import (
     VMShootError,
@@ -79,6 +84,7 @@ __all__ = [
     "Ticket",
     "TranslationResult",
     "WalkResult",
+    "InvalidationNotice",
     # 常量
     "PAGE_SIZE",
     "HUGE_PAGE_SIZE",

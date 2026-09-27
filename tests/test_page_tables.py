@@ -9,6 +9,7 @@ from __future__ import annotations
 import unittest
 
 from vmshoot import (
+    AccessType,
     HUGE_PAGE_SIZE,
     MMU,
     MappingConflict,
@@ -99,11 +100,33 @@ class TestSmallPages(unittest.TestCase):
     def test_unmap_and_frame_reuse(self):
         self.mmu.map(self.asid, 0x0000, PERM_RW)  # ppn 0
         self.mmu.map(self.asid, 0x0100, PERM_RW)  # ppn 1
-        self.mmu.unmap(self.asid, 0x0000)
+        tu = self.mmu.unmap(self.asid, 0x0000)
+        # 无核进入过该空间：票据目标为空，finish 立即成功并回收隔离帧
+        self.assertEqual(tu.targets, ())
+        self.mmu.finish(tu.id)
         self.assertIsNone(self.mmu.walk_table(self.asid, 0x0000))
         self.mmu.map(self.asid, 0x0200, PERM_RW)  # 首位适配：重新拿到 ppn 0
         self.assertEqual(self.mmu.walk_table(self.asid, 0x0200).ppn, 0)
         self.assertEqual(self.mmu.walk_table(self.asid, 0x0100).ppn, 1)
+
+    def test_unmap_frame_not_reused_before_all_acks(self):
+        """旧物理页必须等全部目标核 ACK 后才能复用。"""
+        tm = self.mmu.map(self.asid, 0x0000, PERM_RW)  # ppn 0
+        self.mmu.finish(tm.id)
+        self.mmu.translate(self.asid, 0, 0x0000, AccessType.READ)  # 核0 进入并缓存
+        tu = self.mmu.unmap(self.asid, 0x0000)
+        self.assertEqual(tu.targets, (0,))  # 只有核0可能缓存
+        # ACK 之前：帧仍被隔离占用，新映射只能拿到 ppn 1
+        t2 = self.mmu.map(self.asid, 0x0200, PERM_RW)
+        self.assertEqual(self.mmu.walk_table(self.asid, 0x0200).ppn, 1)
+        self.mmu.ack(0, tu.id)
+        self.mmu.finish(tu.id)             # 此刻 ppn 0 才回收
+        self.mmu.ack(0, t2.id)
+        self.mmu.finish(t2.id)
+        t3 = self.mmu.map(self.asid, 0x0300, PERM_RW)
+        self.assertEqual(self.mmu.walk_table(self.asid, 0x0300).ppn, 0)
+        self.mmu.ack(0, t3.id)
+        self.mmu.finish(t3.id)
 
     def test_unmap_not_mapped(self):
         with self.assertRaises(NotMapped):
@@ -162,7 +185,8 @@ class TestHugePages(unittest.TestCase):
 
     def test_unmap_huge_base_releases_all_frames(self):
         self.mmu.map(self.asid, 0x0000, PERM_RW, huge=True)
-        self.mmu.unmap(self.asid, 0x0000)
+        tu = self.mmu.unmap(self.asid, 0x0000)
+        self.mmu.finish(tu.id)
         self.assertIsNone(self.mmu.walk_table(self.asid, 0x0000))
         self.assertEqual(self.mmu.mem.used_frames(), 0)
 

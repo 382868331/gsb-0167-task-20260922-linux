@@ -32,8 +32,8 @@ def hr(title: str) -> None:
 
 def settle(mmu: MMU, *tickets) -> None:
     for t in tickets:
-        mmu.ack(0, t.id)
-        mmu.ack(1, t.id)
+        for core in t.targets:  # 只等待实际被通知的核
+            mmu.ack(core, t.id)
         mmu.finish(t.id)
 
 
@@ -50,66 +50,71 @@ def main() -> None:
     asid = mmu.create_address_space()
     print(f"[setup] 创建地址空间 ASID={asid}（最多 4 个），2 核，每核 8 项 LRU TLB")
 
-    # ---- 1. 正常映射与翻译 ------------------------------------------------
-    hr("1. 正常结果：小页 + 大页映射与翻译")
+    # ---- 1. 映射时尚无核进入：不发任何失效请求 ----------------------------
+    hr("1. 正常结果：建映射（无核进入过 -> 不发失效请求）")
     t_small = mmu.map(asid, 0x1000, PERM_RW)
     t_huge = mmu.map(asid, 0x4000, PERM_RWX, huge=True)
-    settle(mmu, t_small, t_huge)
-    print("  map 小页 @0x1000 rw-（票据已双核 ACK + finish）")
-    print("  map 大页 @0x4000 rwx，覆盖 0x4000..0x4fff（票据已双核 ACK + finish）")
-    show("核0 读 0x1020", mmu.translate(asid, 0, 0x1020, AccessType.READ))
-    show("核0 再次读 0x1020", mmu.translate(asid, 0, 0x1020, AccessType.READ))  # 命中 TLB
+    for t in (t_small, t_huge):
+        n = mmu.notifications(t.id)[0]
+        print(f"  map 票据 #{t.id}：实际通知核={list(n.notified)}，"
+              f"跳过核={list(n.skipped)}（没有任何核可能缓存过 ASID={asid}）")
+        mmu.finish(t.id)
+    print("  小页 @0x1000 rw-；大页 @0x4000 rwx，覆盖 0x4000..0x4fff")
     show("核1 取指 0x4abc", mmu.translate(asid, 1, 0x4ABC, AccessType.EXECUTE))
-    show("核0 写 0x10ff", mmu.translate(asid, 0, 0x10FF, AccessType.WRITE))
+    show("核1 再次取指 0x4abc", mmu.translate(asid, 1, 0x4ABC, AccessType.EXECUTE))  # 命中 TLB
+    show("核0 读 0x1020", mmu.translate(asid, 0, 0x1020, AccessType.READ))
 
-    # ---- 2. unmap 失效：ACK 前后 ------------------------------------------
-    hr("2. 失效前/后：unmap 0x1000 的票据协议")
-    # 先让双核都缓存该页
-    mmu.translate(asid, 0, 0x1000, AccessType.READ)
-    mmu.translate(asid, 1, 0x1000, AccessType.READ)
-    tu = mmu.unmap(asid, 0x1000)
-    print(f"  页表已更新；票据 #{tu.id} 发出，目标核={list(tu.targets)}，"
-          f"失效 keys={[k for k in tu.keys]}")
-    show("[失效前] 核0 读 0x1000（旧 TLB 项允许存在）",
-         mmu.translate(asid, 0, 0x1000, AccessType.READ))
-    show("[失效前] 核1 读 0x1000（旧 TLB 项允许存在）",
-         mmu.translate(asid, 1, 0x1000, AccessType.READ))
+    # ---- 2. unmap：只有真正缓存过的核被通知；旧页延迟复用 -----------------
+    hr("2. 选择性失效：unmap 大页 0x4000 只通知核1，旧页 finish 后才复用")
+    other = mmu.create_address_space()
+    to = mmu.map(other, 0x9000, PERM_RW)
+    mmu.finish(to.id)
+    # 核0 切到 other 并连续翻译 8 个页：把它 TLB 中 ASID=0 的那一项淘汰干净
+    mmu.switch_address_space(0, other)  # 核0 第一次进入另一个地址空间
+    for i in range(8):
+        t = mmu.map(other, i * 0x1000, PERM_RW)
+        mmu.ack(0, t.id)  # 核0 已在 other 中：被保守纳入目标
+        mmu.finish(t.id)
+    for i in range(8):
+        mmu.translate(other, 0, i * 0x1000, AccessType.READ)
+    print(f"  核1 留在 ASID={asid}（缓存过大页 0x4000）；核0 已切到 ASID={other}")
+    print(f"  核0 TLB 中已无 ASID={asid} 的项，参与范围={list(mmu.participants(asid))}")
+    tu = mmu.unmap(asid, 0x4000)  # 摘表：16 个旧帧进入隔离，暂不复用
+    n = mmu.notifications(tu.id)[0]
+    print(f"  页表已更新；票据 #{tu.id} 实际通知核={list(n.notified)}，"
+          f"跳过核={list(n.skipped)}")
+    print("  减少的是对核0 的无关失效请求；判定基于参与证据（当前空间/TLB/欠账），不漏通知")
+    show("[失效前] 核1 取指 0x4abc（旧大页 TLB 项允许存在）",
+         mmu.translate(asid, 1, 0x4ABC, AccessType.EXECUTE))
     try:
         mmu.finish(tu.id)
     except InvalidationsPending as e:
         print(f"  finish 被阻塞：{e}")
-    mmu.ack(0, tu.id)
-    print("  核0 已 ACK -> 其 TLB 旧项移除")
-    show("[部分 ACK] 核0 读 0x1000", mmu.translate(asid, 0, 0x1000, AccessType.READ))
-    show("[部分 ACK] 核1 读 0x1000（仍旧）",
-         mmu.translate(asid, 1, 0x1000, AccessType.READ))
     mmu.ack(1, tu.id)
     mmu.finish(tu.id)
-    print("  核1 已 ACK；finish 成功")
-    show("[失效后] 核1 读 0x1000", mmu.translate(asid, 1, 0x1000, AccessType.READ))
+    print("  核1 已 ACK；finish 成功，16 个旧物理帧此刻才回收（未被提前复用）")
+    show("[失效后] 核1 取指 0x4abc", mmu.translate(asid, 1, 0x4ABC, AccessType.EXECUTE))
 
-    # ---- 3. 大页中间改权限 ------------------------------------------------
-    hr("3. 大页中间改权限：0x4300 rwx -> r--（大页就地拆成 16 小页）")
-    mmu.translate(asid, 0, 0x4300, AccessType.WRITE)  # 核0 预填大页项
-    tp = mmu.protect(asid, 0x4300, PERM_READ)
-    print(f"  页表已拆分并更新；票据 #{tp.id} 覆盖 {len(tp.keys)} 个小页 key")
-    show("[失效前] 核0 写 0x4300（旧大页 TLB 项仍可写）",
-         mmu.translate(asid, 0, 0x4300, AccessType.WRITE))
+    # ---- 3. 旧确认迟到后参与范围收缩 --------------------------------------
+    hr("3. 旧确认迟到与范围收缩：protect 小页 0x1000")
+    show("[改权限前] 核1 写 0x1080（按 rw- 成功，旧项带写权限）",
+         mmu.translate(asid, 1, 0x1080, AccessType.WRITE))
+    tp = mmu.protect(asid, 0x1000, PERM_READ)
+    n = mmu.notifications(tp.id)[0]
+    print(f"  页表已更新；票据 #{tp.id} 实际通知核={list(n.notified)}，"
+          f"跳过核={list(n.skipped)}（核0 已切走且无 ASID={asid} 缓存/欠账）")
+    show("[失效前] 核1 写 0x1080（旧 TLB 项仍带写权限）",
+         mmu.translate(asid, 1, 0x1080, AccessType.WRITE))
     settle(mmu, tp)
-    show("[失效后] 核0 写 0x4300（目标页只读）",
-         mmu.translate(asid, 0, 0x4300, AccessType.WRITE))
-    show("[失效后] 核0 读 0x4300", mmu.translate(asid, 0, 0x4300, AccessType.READ))
-    show("[失效后] 核1 写 0x4400（其他映射保持 rwx）",
-         mmu.translate(asid, 1, 0x4400, AccessType.WRITE))
-    show("[失效后] 核1 取指 0x4f00（其他映射保持 rwx）",
-         mmu.translate(asid, 1, 0x4F00, AccessType.EXECUTE))
-    # 全部 ACK 后，用无 TLB 遍历器独立核对页表真相
-    w_gone = mmu.walk_table(asid, 0x1000)
-    w_tgt = mmu.walk_table(asid, 0x4300)
-    w_other = mmu.walk_table(asid, 0x4F00)
-    print(f"  无 TLB 遍历器核对：0x1000 -> {w_gone}；"
-          f"0x4300 -> ppn={w_tgt.ppn} perms={perm_to_str(w_tgt.perms)} huge={w_tgt.huge}；"
-          f"0x4f00 -> perms={perm_to_str(w_other.perms)}")
+    print("  ACK（含迟到旧确认）到达后参与范围重估；后续票据不再无关等待已切走的核")
+    show("[失效后] 核1 写 0x1080（只读）",
+         mmu.translate(asid, 1, 0x1080, AccessType.WRITE))
+    show("[失效后] 核1 读 0x1080", mmu.translate(asid, 1, 0x1080, AccessType.READ))
+    # 无 TLB 遍历器独立核对页表真相
+    w_gone = mmu.walk_table(asid, 0x4000)
+    w_tgt = mmu.walk_table(asid, 0x1000)
+    print(f"  无 TLB 遍历器核对：0x4000 -> {w_gone}；"
+          f"0x1000 -> ppn={w_tgt.ppn} perms={perm_to_str(w_tgt.perms)} huge={w_tgt.huge}")
 
     # ---- 4a. 真实触发的拒绝：跨页访问 -------------------------------------
     hr("4. 真实触发的拒绝/异常边界")
@@ -117,15 +122,15 @@ def main() -> None:
     settle(mmu, t_ro)
     try:
         # 0x20fa 起 20 字节：0xfa + 20 = 270 > 256，越过小页边界
-        mmu.translate(asid, 0, 0x20FA, AccessType.READ, length=20)
+        mmu.translate(asid, 1, 0x20FA, AccessType.READ, length=20)
     except CrossPageAccess as e:
         print(f"  跨页访问被拒绝：{type(e).__name__}: {e}")
-    # 对照：同样长度在大页内部跨小页边界是允许的
-    ok = mmu.translate(asid, 0, 0x4FF0, AccessType.READ, length=16)
-    print(f"  对照：大页内 0x4ff0 起 16 字节未跨 4096 边界 -> "
-          f"OK phys=0x{ok.phys_addr:04x}")
+    # 对照：长度 1 在页边界地址是允许的
+    ok = mmu.translate(asid, 1, 0x20FF, AccessType.READ, length=1)
+    print(f"  对照：0x20ff 起 1 字节不跨页 -> OK phys=0x{ok.phys_addr:04x}")
 
     # ---- 4b. 真实触发的拒绝：未完成票据阻塞 ASID 复用 ---------------------
+    mmu.destroy_address_space(other)  # 回收演示用空间，腾出槽位
     a1 = mmu.create_address_space()
     a2 = mmu.create_address_space()
     a3 = mmu.create_address_space()
@@ -137,8 +142,7 @@ def main() -> None:
         mmu.create_address_space()  # 4 槽位中 1/2/3 活动，0 被僵尸票据占据
     except AsidBusy as e:
         print(f"  ASID 复用被拒绝：{type(e).__name__}: {e}")
-    mmu.ack(0, th.id)
-    mmu.ack(1, th.id)
+    # th 无目标核（没有核进入过 a1）：直接 finish 即释放槽位
     mmu.finish(th.id)
     mmu.destroy_address_space(a2)
     reused = mmu.create_address_space()

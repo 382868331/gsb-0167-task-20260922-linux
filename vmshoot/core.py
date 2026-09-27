@@ -71,9 +71,12 @@ class Ticket:
 
     * ``kind``：``map`` / ``unmap`` / ``protect``；
     * ``keys``：需要失效的 TLB key（小页粒度的 ``(asid, vpn)``）；
-    * ``targets``：必须 ACK 的核（本实现中恒为全部核）；
+    * ``targets``：实际收到失效请求、必须 ACK 的核（选择性失效：只含
+      发票时确实可能缓存过该地址空间的核）；
     * ``acks``：已 ACK 的核集合；
-    * 票据在 :meth:`MMU.finish` 成功后关闭并从活动票据表移除。
+    * ``free_small`` / ``free_huge``：摘表后被隔离、必须等全部目标核 ACK
+      才能回收复用的物理帧（小页帧号列表 / 大页起始帧号列表）；
+    * 票据在 :meth:`MMU.finish` 成功后关闭并从活动票据表移除，届时才释放帧。
     """
 
     id: int
@@ -84,6 +87,18 @@ class Ticket:
     targets: tuple[int, ...]
     acks: set[int] = field(default_factory=set)
     closed: bool = False
+    free_small: tuple[int, ...] = ()
+    free_huge: tuple[int, ...] = ()
+
+    @property
+    def notified(self) -> tuple[int, ...]:
+        """实际收到本次失效请求的核（``targets`` 的同义，供验收输出）。"""
+        return self.targets
+
+    @property
+    def skipped(self) -> tuple[int, ...]:
+        """依据参与范围判定无需通知的核。"""
+        return tuple(c for c in range(NUM_CORES) if c not in self.targets)
 
     @property
     def pending(self) -> tuple[int, ...]:
@@ -138,6 +153,25 @@ class WalkResult:
     def phys_addr(self) -> int:
         off_mask = HUGE_PAGE_MASK if self.huge else PAGE_MASK
         return self.ppn * PAGE_SIZE + (self.vaddr & off_mask)
+
+
+@dataclass(frozen=True)
+class InvalidationNotice:
+    """一次失效实际发出的通知记录（用于输出/核对“通知了哪些核”）。
+
+    * ``ticket_id``：票据号；
+    * ``asid`` / ``kind`` / ``vaddr``：失效来源；
+    * ``notified``：实际发送失效请求的核；
+    * ``skipped``：依据参与范围跳过的核——跳过的是**无关失效请求**，
+      这些核从无该地址空间的缓存参与记录，必要检查并未被省略。
+    """
+
+    ticket_id: int
+    asid: int
+    kind: str
+    vaddr: int
+    notified: tuple[int, ...]
+    skipped: tuple[int, ...]
 
 
 # ===========================================================================
@@ -206,6 +240,9 @@ class AddressSpace:
         ``vaddr`` 必须是映射区起始：小页为 256 对齐地址；大页必须给其 4096
         对齐的起始地址——unmap 不做隐式大页拆分（大页内部地址抛
         :class:`MappingConflict`，避免静默曲解调用方意图）。
+
+        只做“摘表”：旧物理帧不在此处释放，由调用方（:class:`MMU`）在
+        全部目标核 ACK 后回收，保证旧物理页不会在陈旧 TLB 项仍存在时被复用。
         """
         if vaddr & PAGE_MASK:
             raise ValueError(f"unmap 要求 256 对齐，得到 vaddr=0x{vaddr:x}")
@@ -219,14 +256,12 @@ class AddressSpace:
                     "或先 protect 拆分后再逐页 unmap"
                 )
             pte = l1e
-            self.l1[l1i] = None       # 先摘表，再释放帧
-            self.mem.free_huge(pte.ppn)
+            self.l1[l1i] = None       # 摘表；帧延迟到票据 finish 时释放
             return pte, True
         if l1e is None or l1e[l2i] is None:
             raise NotMapped(f"vaddr=0x{vaddr:x} 没有映射")
         pte = l1e[l2i]
-        l1e[l2i] = None              # 先摘表，再释放帧
-        self.mem.free_frame(pte.ppn)
+        l1e[l2i] = None              # 摘表；帧延迟到票据 finish 时释放
         if all(x is None for x in l1e):
             self.l1[l1i] = None  # 回收空的二级表
         return pte, False
@@ -304,6 +339,13 @@ class MMU:
         self._tlb: list[OrderedDict] = [OrderedDict() for _ in range(NUM_CORES)]
         self._tickets: dict[int, Ticket] = {}
         self._next_ticket = 1
+        # 每核当前所在地址空间：None 表示未运行任何空间（冷启动/未切换过）。
+        self._current: list[int | None] = [None] * NUM_CORES
+        # 参与范围 participants[asid]：自该空间建立以来“进入过、或票据证据表明
+        # 可能仍缓存它”的核集合。销毁的空间其集合保留到最后一张僵尸票据 finish。
+        self._participants: dict[int, set[int]] = {}
+        # 实际发出的失效通知记录（按票据顺序）。
+        self._notices: list[InvalidationNotice] = []
 
     # ---- 基础校验 -----------------------------------------------------------
     @staticmethod
@@ -344,6 +386,7 @@ class MMU:
                 continue
             sp = AddressSpace(cand, self.mem)
             self._spaces[cand] = sp
+            self._participants.setdefault(cand, set())
             return cand
         raise AsidBusy(busy[0], self._pending_for_asid(busy[0]))
 
@@ -358,26 +401,135 @@ class MMU:
         这正是题面“新 ASID 不能复用未完成票据”的约束。全部票据 finish 后编号立即可用。
         """
         sp = self._space(asid)
-        for tlb in self._tlb:
+        # 同步冲刷所有核上该 ASID 的缓存项（此时调用方已知晓空间销毁）。
+        for core, tlb in enumerate(self._tlb):
             dead = [k for k in tlb if k[0] == sp.asid]
             for k in dead:
                 del tlb[k]
+        for core in range(NUM_CORES):
+            if self._current[core] == sp.asid:
+                self._current[core] = None
+        # 页表中的帧可以立即回收：上面已同步摘除所有核的相关 TLB 项，
+        # 不再存在陈旧翻译能引用它们。未 finish 票据的隔离帧随票据 finish 释放。
         sp.destroy()
         del self._spaces[sp.asid]
+        self._recompute_participants(sp.asid)
 
     # ---- 票据 ---------------------------------------------------------------
-    def _issue(self, asid: int, kind: str, vaddr: int, keys: tuple) -> Ticket:
+    def _has_tlb_for(self, core: int, asid: int) -> bool:
+        """核 ``core`` 的 TLB 中当前是否缓存了地址空间 ``asid`` 的任意 key。"""
+        return any(k[0] == asid for k in self._tlb[core])
+
+    def _has_outstanding_ticket(self, core: int, asid: int) -> bool:
+        """核 ``core`` 是否仍欠地址空间 ``asid`` 某张票据的 ACK。"""
+        return any(
+            t.asid == asid and core in t.targets and core not in t.acks
+            for t in self._tickets.values()
+        )
+
+    def _recompute_participants(self, asid: int) -> None:
+        """按当前可观察证据收缩参与范围（只在事件点精确化，从不盲目扩大之外漏人）。
+
+        一个核“确实可能缓存过该地址空间”当且仅当下列任一保守条件成立：
+
+        1. 它当前正在运行该空间（``self._current[core] == asid``）——
+           可能在任何时刻填入缓存，包含“第一次进入”尚未产生翻译的情况；
+        2. 它的 TLB 里现存该空间的 key——确有缓存项（即便已切走，陈旧项仍在）；
+        3. 它还欠该空间某张未 finish 票据的 ACK——“旧确认迟到”窗口里，
+           其身份不能在发新票据前被剔除，否则可能漏发必要失效。
+
+        三条都不成立的核不可能持有该空间的缓存，也无协议欠账，可安全移出范围。
+        """
+        kept = {
+            core
+            for core in range(NUM_CORES)
+            if self._current[core] == asid
+            or self._has_tlb_for(core, asid)
+            or self._has_outstanding_ticket(core, asid)
+        }
+        if kept:
+            self._participants[asid] = kept
+        else:
+            self._participants.pop(asid, None)
+
+    def _note_entry(self, core: int, asid: int) -> None:
+        """记录核 ``core`` 进入地址空间 ``asid``（切换/首次翻译填充）。
+
+        进入是只增的参与证据；之后是否能收缩由 :meth:`_recompute_participants`
+        在 ACK / 切换 / TLB 变化等事件点判断。
+        """
+        self._participants.setdefault(asid, set()).add(core)
+
+    def _issue(self, asid: int, kind: str, vaddr: int, keys: tuple,
+               free_small: tuple[int, ...] = (),
+               free_huge: tuple[int, ...] = ()) -> Ticket:
+        # 发票前先按最新证据收缩范围（处理“旧确认迟到/已切走/项已淘汰”）。
+        self._recompute_participants(asid)
+        targets = tuple(sorted(self._participants.get(asid, set())))
         t = Ticket(
             id=self._next_ticket,
             asid=asid,
             kind=kind,
             vaddr=vaddr,
             keys=tuple(keys),
-            targets=tuple(range(NUM_CORES)),
+            targets=targets,
+            free_small=tuple(free_small),
+            free_huge=tuple(free_huge),
         )
         self._next_ticket += 1
         self._tickets[t.id] = t
+        self._notices.append(
+            InvalidationNotice(
+                t.id, asid, kind, vaddr,
+                notified=t.targets,
+                skipped=tuple(c for c in range(NUM_CORES) if c not in t.targets),
+            )
+        )
         return t
+
+    def notifications(self, ticket_id=None) -> list[InvalidationNotice]:
+        """输出实际发出的失效通知（票据号、实际通知核、跳过核）。
+
+        不传 ``ticket_id`` 时按发票顺序返回全部；传入时返回该票据的一条记录
+        （票据已 finish 也可查，记录用于说明“减少的是无关失效请求”）。
+        """
+        if ticket_id is None:
+            return list(self._notices)
+        tid = validate_int(ticket_id, "ticket_id")
+        return [n for n in self._notices if n.ticket_id == tid]
+
+    def participants(self, asid) -> tuple[int, ...]:
+        """当前参与范围：确实可能缓存过该地址空间的核（保守上界）。"""
+        sp = self._space(asid)
+        self._recompute_participants(sp.asid)
+        return tuple(sorted(self._participants.get(sp.asid, set())))
+
+    def switch_address_space(self, core_id, asid) -> None:
+        """核 ``core_id`` 切换（或首次进入）地址空间 ``asid``。
+
+        显式的上下文切换事件：切换后该核即成为新空间的参与者（第一次进入也
+        在此登记）；旧空间的参与范围按其当前缓存/欠账证据重新评估。
+        传入 ``None`` 表示该核切出到无地址空间状态。
+        """
+        core = self._check_core(core_id)
+        old = self._current[core]
+        if asid is None:
+            new = None
+        else:
+            a = validate_int(asid, "asid")
+            if self._spaces.get(a) is None:
+                raise InvalidAddressSpace(f"ASID {a} 不存在或已销毁，不能切换进入")
+            new = a
+        self._current[core] = new
+        if new is not None:
+            self._note_entry(core, new)
+            self._recompute_participants(new)
+        if old is not None and old != new:
+            self._recompute_participants(old)
+
+    def current_address_space(self, core_id) -> int | None:
+        """核 ``core_id`` 当前所在地址空间（``None``：尚未进入/已切出）。"""
+        return self._current[self._check_core(core_id)]
 
     @staticmethod
     def _keys_for(asid: int, vaddr: int, huge: bool) -> tuple[tuple[int, int], ...]:
@@ -403,6 +555,9 @@ class MMU:
         for k in t.keys:
             tlb.pop(k, None)
         t.acks.add(c)
+        # ACK（含“旧确认迟到”）后证据更新：该核若已切走且无别的欠账/缓存，
+        # 可从参与范围移出，后续票据不再通知它。
+        self._recompute_participants(t.asid)
         return t
 
     def finish(self, ticket_id) -> Ticket:
@@ -413,8 +568,14 @@ class MMU:
             raise TicketError(f"票据 {tid} 不存在或已 finish")
         if t.pending:
             raise InvalidationsPending(tid, t.pending)
+        # 全部目标核确认后，摘表隔离的旧物理帧此刻才允许回收复用。
+        for ppn in t.free_small:
+            self.mem.free_frame(ppn)
+        for base in t.free_huge:
+            self.mem.free_huge(base)
         t.closed = True
         del self._tickets[tid]
+        self._recompute_participants(t.asid)
         return t
 
     def pending_tickets(self, asid=None) -> list[int]:
@@ -439,8 +600,12 @@ class MMU:
     def unmap(self, asid, vaddr) -> Ticket:
         sp = self._space(asid)
         va = validate_vaddr(vaddr, "vaddr")
-        _, huge = sp.unmap(va)
-        return self._issue(sp.asid, "unmap", va, self._keys_for(sp.asid, va, huge))
+        pte, huge = sp.unmap(va)  # 只摘表，帧进入隔离
+        free_small = () if huge else (pte.ppn,)
+        free_huge = (pte.ppn,) if huge else ()
+        return self._issue(sp.asid, "unmap", va,
+                           self._keys_for(sp.asid, va, huge),
+                           free_small=free_small, free_huge=free_huge)
 
     def protect(self, asid, vaddr, perms) -> Ticket:
         """改权限。``vaddr`` 必须 256 对齐（不做静默向下取整）。
@@ -523,6 +688,12 @@ class MMU:
                                          "walk", sp.asid, va)
             entry = (wr.ppn, wr.perms, wr.huge)
             via = "walk"
+            # 遍历填表意味着该核此刻确实在该地址空间中运行（隐式首次进入）：
+            # 登记参与，保证此后发票据不会漏掉它，即使调用方没显式 switch。
+            first_entry = self._current[core] != sp.asid
+            if first_entry:
+                self._current[core] = sp.asid
+            self._note_entry(core, sp.asid)
             # 填入 TLB：大页用 16 对齐的标记 key
             key = (sp.asid, vpn if not wr.huge else (vpn & ~(L2_SIZE - 1)))
             tlb = self._tlb[core]

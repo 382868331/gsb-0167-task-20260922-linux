@@ -19,6 +19,7 @@ from vmshoot import (
     AsidBusy,
     CrossPageAccess,
     FrameExhausted,
+    InvalidAddressSpace,
     InvalidationsPending,
     MappingConflict,
     MappingExists,
@@ -50,6 +51,8 @@ class RefMMU:
         self.tlb: list[OrderedDict] = [OrderedDict() for _ in range(2)]
         self.tickets: dict[int, dict] = {}
         self.next_id = 1
+        self.current: list[int | None] = [None, None]
+        self.participants: dict[int, set] = {}
 
     # ---- 帧：独立首位适配 ----------------------------------------------
     def alloc_small(self) -> int:
@@ -78,6 +81,7 @@ class RefMMU:
             if any(t["asid"] == cand for t in self.tickets.values()):
                 continue
             self.spaces[cand] = [None] * 16
+            self.participants.setdefault(cand, set())
             return cand
         raise AsidBusy(0, [])
 
@@ -96,6 +100,38 @@ class RefMMU:
         for tlb in self.tlb:
             for k in [k for k in tlb if k[0] == asid]:
                 del tlb[k]
+        for c in range(2):
+            if self.current[c] == asid:
+                self.current[c] = None
+        self.recompute(asid)
+
+    # ---- 参与范围（独立实现，与被测相同的保守三条件） ------------------
+    def recompute(self, asid) -> None:
+        kept = set()
+        for c in range(2):
+            if (self.current[c] == asid
+                    or any(k[0] == asid for k in self.tlb[c])
+                    or any(t["asid"] == asid and c in t["targets"]
+                           and c not in t["acks"] for t in self.tickets.values())):
+                kept.add(c)
+        if kept:
+            self.participants[asid] = kept
+        else:
+            self.participants.pop(asid, None)
+
+    def note_entry(self, core, asid) -> None:
+        self.participants.setdefault(asid, set()).add(core)
+
+    def switch(self, core, asid) -> None:
+        old = self.current[core]
+        if asid is not None and asid not in self.spaces:
+            raise InvalidAddressSpace("ref bad switch")
+        self.current[core] = asid
+        if asid is not None:
+            self.note_entry(core, asid)
+            self.recompute(asid)
+        if old is not None and old != asid:
+            self.recompute(old)
 
     # ---- 遍历 -----------------------------------------------------------
     def walk(self, asid: int, va: int):
@@ -110,11 +146,17 @@ class RefMMU:
         return None if pte is None else (pte[0], pte[1], False)
 
     # ---- 结构操作 -------------------------------------------------------
-    def issue(self, asid, kind, va, keys) -> int:
+    def issue(self, asid, kind, va, keys,
+              free_small=(), free_huge=()) -> int:
+        self.recompute(asid)
+        targets = tuple(sorted(self.participants.get(asid, set())))
         tid = self.next_id
         self.next_id += 1
         self.tickets[tid] = {"asid": asid, "kind": kind, "va": va,
-                             "keys": tuple(keys), "acks": set()}
+                             "keys": tuple(keys), "acks": set(),
+                             "targets": targets,
+                             "free_small": tuple(free_small),
+                             "free_huge": tuple(free_huge)}
         return tid
 
     @staticmethod
@@ -158,18 +200,17 @@ class RefMMU:
             if l2i != 0:
                 raise MappingConflict("ref huge interior")
             _, base, _ = e
-            for j in range(16):
-                self.used[base + j] = False
             self.spaces[asid][l1i] = None
-            return self.issue(asid, "unmap", va, self.keys_for(asid, va, True))
+            return self.issue(asid, "unmap", va, self.keys_for(asid, va, True),
+                              free_huge=(base,))
         if e is None or e[l2i] is None:
             raise NotMapped("ref")
         ppn = e[l2i][0]
-        self.used[ppn] = False
         e[l2i] = None
         if all(x is None for x in e):
             self.spaces[asid][l1i] = None
-        return self.issue(asid, "unmap", va, self.keys_for(asid, va, False))
+        return self.issue(asid, "unmap", va, self.keys_for(asid, va, False),
+                          free_small=(ppn,))
 
     def protect(self, asid, va, perms) -> int:
         if va & 0xFF:
@@ -192,20 +233,30 @@ class RefMMU:
         t = self.tickets.get(tid)
         if t is None:
             raise TicketError("ref no ticket")
+        if core not in t["targets"]:
+            raise TicketError("ref non-target ack")
         if core in t["acks"]:
             raise TicketError("ref dup ack")
         for k in t["keys"]:
             self.tlb[core].pop(k, None)
         t["acks"].add(core)
+        self.recompute(t["asid"])
 
     def finish(self, tid) -> None:
         t = self.tickets.get(tid)
         if t is None:
             raise TicketError("ref finished")
-        if t["acks"] != {0, 1}:
+        asid = t["asid"]
+        if any(c not in t["acks"] for c in t["targets"]):
             raise InvalidationsPending(
-                tid, tuple(c for c in (0, 1) if c not in t["acks"]))
+                tid, tuple(c for c in t["targets"] if c not in t["acks"]))
+        for ppn in t["free_small"]:
+            self.used[ppn] = False
+        for base in t["free_huge"]:
+            for j in range(16):
+                self.used[base + j] = False
         del self.tickets[tid]
+        self.recompute(asid)
 
     # ---- 翻译 -----------------------------------------------------------
     def translate(self, asid, core, va, need_bit, length):
@@ -232,6 +283,9 @@ class RefMMU:
             if w is None:
                 return (False, None, "not_mapped", "walk")
             entry = w
+            if self.current[core] != asid:
+                self.current[core] = asid
+            self.note_entry(core, asid)
             key = (asid, vpn if not w[2] else vpn & ~15)
             if key in tlb:
                 tlb.move_to_end(key)
@@ -293,6 +347,18 @@ class TestDifferential(unittest.TestCase):
             for k in ref.tlb[core]:
                 self.assertEqual(sut._tlb[core][k], ref.tlb[core][k])
 
+    def _assert_participants_match(self, sut: MMU, ref: RefMMU):
+        asids = set(sut._spaces) | set(ref.spaces) | set(ref.tickets)
+        for a in asids:
+            if a in sut._spaces:
+                got = set(sut.participants(a))
+            else:
+                sut._recompute_participants(a)
+                got = set(sut._participants.get(a, set()))
+            self.assertEqual(got, ref.participants.get(a, set()), f"participants asid={a}")
+        self.assertEqual([sut.current_address_space(c) for c in range(2)],
+                         list(ref.current))
+
     # ---- 双跑比较器 ------------------------------------------------------
     def _cmp_void(self, fn, sut, ref):
         try:
@@ -324,7 +390,7 @@ class TestDifferential(unittest.TestCase):
         rt = ref.tickets[rid]
         self.assertEqual(st.id, rid)
         self.assertEqual(st.keys, rt["keys"])
-        self.assertEqual(st.targets, (0, 1))
+        self.assertEqual(st.targets, rt["targets"])
         self.assertEqual(st.asid, rt["asid"])
 
     def _cmp_translate(self, sut, ref, asid, core, va, acc, length):
@@ -360,7 +426,17 @@ class TestDifferential(unittest.TestCase):
                 elif r < 0.12 and active:
                     a = rng.choice(active)
                     self._cmp_void(lambda m, a=a: _ref_destroy(m, a), sut, ref)
-                elif r < 0.40 and active:
+                elif r < 0.18 and active:
+                    # 显式上下文切换（含切到 None）：更新参与范围
+                    core = rng.randrange(2)
+                    new_asid = rng.choice(active + [None])
+                    def _switch(m, core=core, new_asid=new_asid):
+                        if isinstance(m, RefMMU):
+                            m.switch(core, new_asid)
+                        else:
+                            m.switch_address_space(core, new_asid)
+                    self._cmp_void(_switch, sut, ref)
+                elif r < 0.46 and active:
                     a = rng.choice(active)
                     huge = rng.random() < 0.35
                     va = self._huge_va(rng) if huge else self._small_va(rng)
@@ -369,17 +445,17 @@ class TestDifferential(unittest.TestCase):
                         lambda m, a=a, va=va, p=perms, h=huge:
                             m.map(a, va, p, h) if isinstance(m, RefMMU)
                             else m.map(a, va, p, huge=h), sut, ref)
-                elif r < 0.50 and active:
+                elif r < 0.56 and active:
                     a = rng.choice(active)
                     self._cmp_ticket(
                         lambda m, a=a, va=self._small_va(rng): m.unmap(a, va), sut, ref)
-                elif r < 0.62 and active:
+                elif r < 0.68 and active:
                     a = rng.choice(active)
                     va = self._small_va(rng)
                     perms = rng.choice(PERMS_CHOICES)
                     self._cmp_ticket(
                         lambda m, a=a, va=va, p=perms: m.protect(a, va, p), sut, ref)
-                elif r < 0.88 and active:
+                elif r < 0.90 and active:
                     a = rng.choice(active)
                     core = rng.randrange(2)
                     va = rng.randrange(0x10000)
@@ -401,10 +477,11 @@ class TestDifferential(unittest.TestCase):
                         self._cmp_void(lambda m, t=tid: m.finish(t), sut, ref)
                 else:
                     self._assert_walks_match(sut, ref)
+                    self._assert_participants_match(sut, ref)
 
         # 收尾：ACK 并 finish 全部票据，做最终全量核对
         for tid in sorted(ref.tickets):
-            for core in range(2):
+            for core in list(ref.tickets[tid]["targets"]):
                 if core not in ref.tickets[tid]["acks"]:
                     ref.ack(core, tid)
                     sut.ack(core, tid)
@@ -413,6 +490,7 @@ class TestDifferential(unittest.TestCase):
         self.assertEqual(sut.pending_tickets(), [])
         self._assert_walks_match(sut, ref)
         self._assert_tlb_match(sut, ref)
+        self._assert_participants_match(sut, ref)
         self.assertEqual(sut.mem.used_frames(), ref.used_frames())
 
 

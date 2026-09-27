@@ -29,6 +29,14 @@ def warm(mmu, asid, core, vaddr, access=AccessType.READ):
     return mmu.translate(asid, core, vaddr, access)
 
 
+def settle_targets(mmu, *tickets):
+    """只对票据的实际目标核 ACK 并 finish（跳过非目标核）。"""
+    for t in tickets:
+        for core in t.targets:
+            mmu.ack(core, t.id)
+        mmu.finish(t.id)
+
+
 class TestTLBLru(unittest.TestCase):
     def setUp(self):
         self.mmu = MMU()
@@ -39,9 +47,10 @@ class TestTLBLru(unittest.TestCase):
             self.mmu.map(self.asid, va, PERM_RWX)
 
     def _settle_tickets(self):
-        for tid in self.mmu.pending_tickets():
-            self.mmu.ack(0, tid)
-            self.mmu.ack(1, tid)
+        for tid in list(self.mmu.pending_tickets()):
+            t = self.mmu.notifications(tid)[0]
+            for core in t.notified:
+                self.mmu.ack(core, tid)
             self.mmu.finish(tid)
 
     def test_capacity_eight_and_lru_eviction(self):
@@ -76,9 +85,9 @@ class TestTLBAsidIsolation(unittest.TestCase):
         # 两个地址空间映射同一虚页
         self.ta = self.mmu.map(self.a, 0x1000, PERM_RW)
         self.tb = self.mmu.map(self.b, 0x1000, PERM_RW)
+        # 此时没有任何核进入过任一空间：票据目标为空，无需发失效请求
         for t in (self.ta, self.tb):
-            self.mmu.ack(0, t.id)
-            self.mmu.ack(1, t.id)
+            self.assertEqual(t.targets, ())
             self.mmu.finish(t.id)
 
     def test_same_vpn_distinct_keys_and_frames(self):
@@ -95,8 +104,9 @@ class TestTLBAsidIsolation(unittest.TestCase):
         warm(self.mmu, self.a, 0, 0x1000)
         warm(self.mmu, self.b, 0, 0x1000)
         t = self.mmu.unmap(self.a, 0x1000)
+        # 只有核0进入过这两个空间：只通知核0，核1是无关核不等待
+        self.assertEqual(t.targets, (0,))
         self.mmu.ack(0, t.id)
-        self.mmu.ack(1, t.id)
         self.mmu.finish(t.id)
         # B 仍可命中（key 含 ASID，未被失效）
         rb = self.mmu.translate(self.b, 0, 0x1000, AccessType.READ)
@@ -115,8 +125,6 @@ class TestStaleAndTicketProtocol(unittest.TestCase):
 
     def test_stale_entry_observable_before_ack_gone_after(self):
         t = self.mmu.map(self.asid, 0x1000, PERM_RW)
-        self.mmu.ack(0, t.id)
-        self.mmu.ack(1, t.id)
         self.mmu.finish(t.id)
         # 两个核都预热到同一映射
         warm(self.mmu, self.asid, 0, 0x1000)
@@ -154,16 +162,14 @@ class TestStaleAndTicketProtocol(unittest.TestCase):
 
     def test_stale_permission_before_ack_then_fault_after(self):
         t = self.mmu.map(self.asid, 0x2000, PERM_RWX)
-        self.mmu.ack(0, t.id)
-        self.mmu.ack(1, t.id)
         self.mmu.finish(t.id)
         warm(self.mmu, self.asid, 0, 0x2000, AccessType.READ)
         tp = self.mmu.protect(self.asid, 0x2000, PERM_READ)
+        # 只有核0进入过：只通知核0（核1不被无关等待）
+        self.assertEqual(tp.targets, (0,))
         # ACK 前旧项仍带 w/x
         self.assertTrue(self.mmu.translate(self.asid, 0, 0x2000, AccessType.WRITE).ok)
-        self.mmu.ack(0, tp.id)
-        self.mmu.ack(1, tp.id)
-        self.mmu.finish(tp.id)
+        settle_targets(self.mmu, tp)
         # ACK 后重走页表 -> write fault
         r = self.mmu.translate(self.asid, 0, 0x2000, AccessType.WRITE)
         self.assertFalse(r.ok)
@@ -177,8 +183,9 @@ class TestStaleAndTicketProtocol(unittest.TestCase):
             self.mmu.finish(999)
         with self.assertRaises(TicketError):
             self.mmu.ack(0, 999)
-        self.mmu.ack(0, t.id)
-        self.mmu.ack(1, t.id)
+        # 无核进入过：无目标核，非目标核 ACK 是非法操作
+        with self.assertRaises(TicketError):
+            self.mmu.ack(0, t.id)
         self.mmu.finish(t.id)
         with self.assertRaises(TicketError):
             self.mmu.finish(t.id)  # 已关闭
@@ -201,8 +208,6 @@ class TestHugeStaleAfterSplit(unittest.TestCase):
 
     def test_huge_cached_on_both_cores_split_invalidates(self):
         t = self.mmu.map(self.asid, 0x4000, PERM_RWX, huge=True)
-        self.mmu.ack(0, t.id)
-        self.mmu.ack(1, t.id)
         self.mmu.finish(t.id)
         # 两核在大页不同偏移预热，填入大页标记 key (asid, vpn&~15)
         warm(self.mmu, self.asid, 0, 0x4100)
@@ -212,14 +217,14 @@ class TestHugeStaleAfterSplit(unittest.TestCase):
         # 大页中间改权限 -> 拆分
         tp = self.mmu.protect(self.asid, 0x4300, PERM_READ)
         self.assertEqual(len(tp.keys), L2_SIZE)
+        # 两核都进入过：双核都在实际通知范围内
+        self.assertEqual(tp.targets, (0, 1))
         # ACK 前核 1 用旧大页项仍可写 0x4300（陈旧）
         stale = self.mmu.translate(self.asid, 1, 0x4300, AccessType.WRITE)
         self.assertTrue(stale.ok)
         self.assertEqual(stale.via, "tlb")
         # 全部 ACK
-        self.mmu.ack(0, tp.id)
-        self.mmu.ack(1, tp.id)
-        self.mmu.finish(tp.id)
+        settle_targets(self.mmu, tp)
         # 0x4300 重走页表 -> 只读 -> write fault
         r = self.mmu.translate(self.asid, 1, 0x4300, AccessType.WRITE)
         self.assertFalse(r.ok)
@@ -235,8 +240,6 @@ class TestTranslateFaultsAndCrossPage(unittest.TestCase):
         self.mmu = MMU()
         self.asid = self.mmu.create_address_space()
         t = self.mmu.map(self.asid, 0x5000, PERM_RX)
-        self.mmu.ack(0, t.id)
-        self.mmu.ack(1, t.id)
         self.mmu.finish(t.id)
 
     def test_not_mapped_fault(self):
@@ -262,8 +265,6 @@ class TestTranslateFaultsAndCrossPage(unittest.TestCase):
 
     def test_huge_cross_page_allows_within_4096(self):
         t = self.mmu.map(self.asid, 0x7000, PERM_RWX, huge=True)
-        self.mmu.ack(0, t.id)
-        self.mmu.ack(1, t.id)
         self.mmu.finish(t.id)
         # 大页内跨小页边界但不跨 4096 大页边界：允许
         r = self.mmu.translate(self.asid, 0, 0x7FF0, AccessType.READ, length=16)
@@ -300,13 +301,12 @@ class TestAsidReuseWithPendingTickets(unittest.TestCase):
             mmu.create_address_space()
         self.assertEqual(cm.exception.asid, 0)
         self.assertEqual(cm.exception.ticket_ids, [t.id])
-        # 核 0 ACK 后仍不能复用（必须全部核 ACK 且 finish）
-        mmu.ack(0, t.id)
+        # 无任何核进入过该空间：票据无目标核，ACK 不改变僵尸状态；
+        # 真正决定槽位释放的是 finish。
+        with self.assertRaises(TicketError):
+            mmu.ack(0, t.id)
         with self.assertRaises(AsidBusy):
             mmu.create_address_space()
-        mmu.ack(1, t.id)
-        with self.assertRaises(AsidBusy):
-            mmu.create_address_space()  # finish 之前仍占用
         mmu.finish(t.id)
         # 现在 0 号可复用（需要先销毁一个活动空间腾出整体名额）
         mmu.destroy_address_space(1)
@@ -316,8 +316,6 @@ class TestAsidReuseWithPendingTickets(unittest.TestCase):
         mmu = MMU()
         a = mmu.create_address_space()
         t = mmu.map(a, 0x1000, PERM_RW)
-        mmu.ack(0, t.id)
-        mmu.ack(1, t.id)
         mmu.finish(t.id)
         warm(mmu, a, 0, 0x1000)
         warm(mmu, a, 1, 0x1000)
@@ -337,6 +335,115 @@ class TestAsidReuseWithPendingTickets(unittest.TestCase):
         self.assertEqual(set(mmu.pending_tickets()), {ta.id, tb.id})
 
 
+class TestSelectiveShootdown(unittest.TestCase):
+    """只通知确实可能缓存过该地址空间的核；不漏通知、不省必要检查。"""
+
+    def setUp(self):
+        self.mmu = MMU()
+        self.a = self.mmu.create_address_space()
+        self.b = self.mmu.create_address_space()
+
+    def _settle(self, t):
+        settle_targets(self.mmu, t)
+
+    def test_no_core_entered_means_no_invalidation_request(self):
+        tm = self.mmu.map(self.a, 0x1000, PERM_RW)
+        self.assertEqual(tm.targets, ())
+        n = self.mmu.notifications(tm.id)[0]
+        self.assertEqual(n.notified, ())
+        self.assertEqual(n.skipped, (0, 1))
+        self.mmu.finish(tm.id)  # 无目标核：无需等待
+
+    def test_only_entered_cores_are_notified(self):
+        tm = self.mmu.map(self.a, 0x1000, PERM_RW)
+        self.mmu.finish(tm.id)
+        # 核1 从未进入 A
+        warm(self.mmu, self.a, 0, 0x1000)
+        tu = self.mmu.unmap(self.a, 0x1000)
+        self.assertEqual(tu.targets, (0,))
+        n = self.mmu.notifications(tu.id)[0]
+        self.assertEqual(n.notified, (0,))
+        self.assertEqual(n.skipped, (1,))  # 减少的是对核1 的无关失效请求
+        # finish 只等待核0：核1 的 ACK 既不需要也不合法
+        with self.assertRaises(TicketError):
+            self.mmu.ack(1, tu.id)
+        self.mmu.ack(0, tu.id)
+        self.mmu.finish(tu.id)
+
+    def test_context_switch_then_first_translation_records_participant(self):
+        tm = self.mmu.map(self.a, 0x1000, PERM_RW)
+        self.mmu.finish(tm.id)
+        # 显式切换：核1 第一次进入 A，即便还没翻译，也要保守通知
+        self.mmu.switch_address_space(1, self.a)
+        self.assertEqual(self.mmu.participants(self.a), (1,))
+        tp = self.mmu.protect(self.a, 0x1000, PERM_READ)
+        self.assertEqual(tp.targets, (1,))
+        self._settle(tp)
+        # 翻译同样隐式登记“第一次进入”
+        tm2 = self.mmu.map(self.b, 0x2000, PERM_RW)
+        self.mmu.finish(tm2.id)
+        warm(self.mmu, self.b, 0, 0x2000)
+        self.assertEqual(self.mmu.participants(self.b), (0,))
+
+    def test_switch_away_and_stale_ack_changes_scope(self):
+        tm = self.mmu.map(self.a, 0x1000, PERM_RW)
+        self.mmu.finish(tm.id)
+        warm(self.mmu, self.a, 0, 0x1000)
+        warm(self.mmu, self.a, 1, 0x1000)
+        # 第一次改权限：两核都可能缓存，双核通知
+        tp1 = self.mmu.protect(self.a, 0x1000, PERM_READ)
+        self.assertEqual(tp1.targets, (0, 1))
+        self.mmu.ack(0, tp1.id)       # 核0 旧确认先到
+        self.mmu.ack(1, tp1.id)       # 核1 的旧确认迟到
+        self.mmu.finish(tp1.id)
+        # 两核切走（核0->B，核1->无空间），且 A 的 TLB 项已被各自 ACK 删除
+        self.mmu.switch_address_space(0, self.b)
+        self.mmu.switch_address_space(1, None)
+        self.assertEqual(self.mmu.participants(self.a), ())
+        # A 已无参与核：再次改权限不发任何失效请求
+        tmw = self.mmu.map(self.a, 0x1100, PERM_RW)  # 新页 map 同样无需通知
+        self.assertEqual(tmw.targets, ())
+        self.mmu.finish(tmw.id)
+
+    def test_unacked_core_stays_in_scope_until_late_ack_arrives(self):
+        tm = self.mmu.map(self.a, 0x1000, PERM_RW)
+        self.mmu.finish(tm.id)
+        warm(self.mmu, self.a, 0, 0x1000)
+        warm(self.mmu, self.a, 1, 0x1000)
+        tu = self.mmu.unmap(self.a, 0x1000)
+        self.assertEqual(tu.targets, (0, 1))
+        # 核1 切走但确认未到：旧确认迟到前不能把它移出范围
+        self.mmu.switch_address_space(1, self.b)
+        tm2 = self.mmu.map(self.a, 0x2000, PERM_RW)
+        self.assertEqual(tm2.targets, (0, 1))  # 核1 仍欠 unmap 的 ACK，保守通知
+        self.mmu.ack(0, tu.id)
+        self.mmu.ack(1, tu.id)  # 迟到的旧确认
+        self.mmu.finish(tu.id)
+        # 迟到确认到达后，核1 仍欠 tm2 的 ACK（它被保守地纳入了 tm2 目标），
+        # 所以范围暂时还含核1；直到它对 tm2 也确认后才退出。
+        self.assertEqual(self.mmu.participants(self.a), (0, 1))
+        settle_targets(self.mmu, tm2)
+        self.assertEqual(self.mmu.participants(self.a), (0,))
+
+    def test_stale_entry_after_lru_eviction_and_switch_shrinks_scope(self):
+        tm = self.mmu.map(self.a, 0x1000, PERM_RW)
+        self.mmu.finish(tm.id)
+        warm(self.mmu, self.a, 1, 0x1000)
+        self.assertEqual(self.mmu.participants(self.a), (1,))
+        # 先用 B 的 8 个不同页（票据此时无目标核）填满映射
+        for i in range(TLB_SIZE):
+            t = self.mmu.map(self.b, i * 0x1000, PERM_RW)
+            self.mmu.finish(t.id)
+        # 核1 连续翻译 B 的 8 个页：第一次翻译隐式进入 B，并把 A 的项淘汰干净
+        for i in range(TLB_SIZE):
+            warm(self.mmu, self.b, 1, i * 0x1000)
+        self.assertFalse(any(k[0] == self.a for k in self.mmu.tlb_keys(1)))
+        # A 的 TLB 项已被淘汰，且 translate 隐式把核1 当前空间改成 B：
+        # A 已无任何参与证据，参与范围收缩为空。
+        self.assertEqual(self.mmu.current_address_space(1), self.b)
+        self.assertEqual(self.mmu.participants(self.a), ())
+
+
 class TestPostAckWalkVerification(unittest.TestCase):
     """验收点：无 TLB 遍历器在全部 ACK 后的核对。"""
 
@@ -350,11 +457,9 @@ class TestPostAckWalkVerification(unittest.TestCase):
         mmu.translate(a, 1, 0x4300, AccessType.WRITE)
         tu = mmu.unmap(a, 0x0000)
         tp = mmu.protect(a, 0x4300, PERM_READ)
-        # 全部 ACK + finish
+        # 对实际目标核 ACK + finish
         for t in (t1, t2, tu, tp):
-            mmu.ack(0, t.id)
-            mmu.ack(1, t.id)
-            mmu.finish(t.id)
+            settle_targets(mmu, t)
         # 无 TLB 遍历器是页表真相的权威：
         self.assertIsNone(mmu.walk_table(a, 0x0000))
         w = mmu.walk_table(a, 0x4300)
